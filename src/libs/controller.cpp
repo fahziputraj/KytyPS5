@@ -148,6 +148,9 @@ private:
 	int              m_connected_count = 0;
 	bool             m_motion_enabled  = true;
 	uint64_t         m_gyro_time       = 0;
+	uint64_t         m_motion_rate_window_ms = 0;
+	uint64_t         m_motion_accel_reports  = 0;
+	uint64_t         m_motion_gyro_reports   = 0;
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
@@ -504,6 +507,9 @@ void GameController::CheckActive() {
 	m_connected     = new_connected;
 	m_state         = {};
 	m_gyro_time     = 0;
+	m_motion_rate_window_ms = 0;
+	m_motion_accel_reports  = 0;
+	m_motion_gyro_reports   = 0;
 	m_up_reference_valid = false;
 	m_states_num    = 0;
 	m_first_state   = 0;
@@ -628,6 +634,29 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 	Common::LockGuard lock(m_mutex);
 	if (id != m_active_id || !m_motion_enabled) {
 		return;
+	}
+
+	// Report SDL-delivered sensor event rates so unusually chatty motion input can be
+	// distinguished from the game's own CPU/render workload. This is not the USB poll rate.
+	constexpr uint64_t motion_rate_log_interval_ms = 5000;
+	const uint64_t    now_ms                        = SDL_GetTicks();
+	if (m_motion_rate_window_ms == 0) {
+		m_motion_rate_window_ms = now_ms;
+	}
+	if (sensor == Sensor::Accel) {
+		m_motion_accel_reports++;
+	} else {
+		m_motion_gyro_reports++;
+	}
+	const uint64_t elapsed_ms = now_ms - m_motion_rate_window_ms;
+	if (elapsed_ms >= motion_rate_log_interval_ms) {
+		const double scale = 1000.0 / static_cast<double>(elapsed_ms);
+		LOGF("Pad motion reports: accel %.1f/s, gyro %.1f/s (SDL event rate; not USB poll rate)\n",
+		     static_cast<double>(m_motion_accel_reports) * scale,
+		     static_cast<double>(m_motion_gyro_reports) * scale);
+		m_motion_rate_window_ms = now_ms;
+		m_motion_accel_reports  = 0;
+		m_motion_gyro_reports   = 0;
 	}
 
 	// Convert acceleration to G; angular velocity is already in rad/s.

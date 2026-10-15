@@ -32,6 +32,7 @@ public:
 	static void ReadSettings(QSettings& s);
 
 	void resizeEvent(QResizeEvent* event) override;
+	void reject() override;
 
 private:
 	MainDialogPrivate* m_p = nullptr;

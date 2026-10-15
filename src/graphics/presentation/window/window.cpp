@@ -471,9 +471,11 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
 			break;
 		case SDL_EVENT_WINDOW_FOCUS_GAINED:
+			loop.focused.store(true, std::memory_order_relaxed);
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
 			break;
 		case SDL_EVENT_WINDOW_FOCUS_LOST:
+			loop.focused.store(false, std::memory_order_relaxed);
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
 			break;
 		case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
@@ -859,6 +861,8 @@ static void WindowCreate(WindowContext& context) {
 	}
 
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	context.loop.focused.store((SDL_GetWindowFlags(context.window) & SDL_WINDOW_INPUT_FOCUS) != 0,
+	                           std::memory_order_relaxed);
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();

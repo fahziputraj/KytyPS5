@@ -176,6 +176,13 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   skip_notice_screen          = false;
+	bool                   shader_warmup_enabled       = true;
+	bool                   pipeline_acceleration_enabled = true;
+	bool                   performance_diagnostics_enabled = false;
+	int                    shader_warmup_threads       = 0; // 0: automatic
+	int                    pipeline_warmup_threads     = 0;
+	int                    pipeline_resident_limit     = 512;
+	QString                pipeline_list_path;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -211,6 +218,13 @@ public:
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
+		shader_warmup_enabled       = other.shader_warmup_enabled;
+		pipeline_acceleration_enabled = other.pipeline_acceleration_enabled;
+		performance_diagnostics_enabled = other.performance_diagnostics_enabled;
+		shader_warmup_threads       = other.shader_warmup_threads;
+		pipeline_warmup_threads     = other.pipeline_warmup_threads;
+		pipeline_resident_limit     = other.pipeline_resident_limit;
+		pipeline_list_path          = other.pipeline_list_path;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;

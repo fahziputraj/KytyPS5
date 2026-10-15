@@ -899,7 +899,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 					height = m_video_out_ctx[0].height;
 				}
 				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
-				m_presenter.Present(blank);
+				m_presenter.Present(blank, false);
 				presented = true;
 			}
 		}
@@ -917,7 +917,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 			if (!any_open) {
 				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
-				m_presenter.Present(blank);
+				m_presenter.Present(blank, false);
 			}
 		}
 		VblankEnd();

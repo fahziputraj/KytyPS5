@@ -33,8 +33,8 @@ public:
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
-	void                         Present(Frame& frame);
-	void                         Present(std::span<const Layer> layers);
+	void                         Present(Frame& frame, bool guest_frame = true);
+	void                         Present(std::span<const Layer> layers, bool guest_frame = true);
 	void                         ClearLayer(int bus);
 	void                         Discard(Frame& frame);
 

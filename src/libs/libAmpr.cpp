@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/ramStats.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -1982,6 +1984,63 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+namespace {
+bool ReuseAprStaging() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_APR_STAGING_REUSE");
+		const bool reuse = value == nullptr || std::strcmp(value, "0") != 0;
+		::printf("APR host staging: %s (up to 4 MiB per reading thread; KYTY_APR_STAGING_REUSE)\n",
+		         reuse ? "reuse enabled" : "reuse disabled");
+		return reuse;
+	}();
+	return enabled;
+}
+
+struct AprReadStorage {
+	std::unique_ptr<uint8_t[]> data;
+	uint32_t capacity = 0;
+	bool borrowed = false;
+};
+
+// Each reader keeps at most one chunk. A nested read while a guest copy is handling a fault
+// gets private storage, so it cannot overwrite bytes still being copied by the outer read.
+class AprReadBuffer final {
+public:
+	explicit AprReadBuffer(uint32_t size): m_size(size) {
+		static thread_local AprReadStorage storage;
+		if (ReuseAprStaging() && !storage.borrowed) {
+			if (storage.capacity < size) {
+				// Read() initializes the returned prefix; only that prefix is copied to the guest.
+				// No need to zero-fill a whole staging chunk before overwriting it with file data.
+				auto replacement = std::make_unique_for_overwrite<uint8_t[]>(size);
+				storage.data = std::move(replacement);
+				storage.capacity = size;
+				Common::RamStats::Range("APR reusable host staging", storage.data.get(), size);
+			}
+			storage.borrowed = true;
+			m_cached = &storage;
+			m_data = storage.data.get();
+		} else {
+			m_fallback.resize(size);
+			m_data = m_fallback.data();
+		}
+	}
+	~AprReadBuffer() {
+		if (m_cached != nullptr) m_cached->borrowed = false;
+	}
+	AprReadBuffer(const AprReadBuffer&) = delete;
+	AprReadBuffer& operator=(const AprReadBuffer&) = delete;
+	[[nodiscard]] uint8_t* Data() const { return m_data; }
+	[[nodiscard]] uint32_t Size() const { return m_size; }
+
+private:
+	AprReadStorage* m_cached = nullptr;
+	uint8_t* m_data = nullptr;
+	uint32_t m_size;
+	std::vector<uint8_t> m_fallback;
+};
+} // namespace
+
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprRead);
@@ -2020,17 +2079,16 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		return OK;
 	}
 
-	std::vector<uint8_t> buffer(
-	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
+	AprReadBuffer buffer(static_cast<uint32_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
 	while (*bytes_read < readable) {
 		const auto request =
-		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
+		    static_cast<uint32_t>(std::min<uint64_t>(buffer.Size(), readable - *bytes_read));
 		uint32_t read = 0;
 		{
 			Profiler::ScopedLoadingOperation host_read(Profiler::LoadingOperation::AprHostRead);
 			HangWatchdog::Scope wait("ampr-host-read", destination + *bytes_read, request,
 			                         *bytes_read, file_offset + *bytes_read);
-			file.Read(buffer.data(), request, &read);
+			file.Read(buffer.Data(), request, &read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprHostReadBytes, read);
 		if (read == 0) {
@@ -2039,7 +2097,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		{
 			Profiler::ScopedLoadingOperation guest_copy(Profiler::LoadingOperation::AprGuestCopy);
 			HangWatchdog::Scope copy("ampr-guest-copy", destination + *bytes_read, read);
-			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.Data(), read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprGuestCopiedBytes, read);
 		*bytes_read += read;

@@ -57,6 +57,7 @@ struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
 	std::atomic_bool paused    = false;
+	std::atomic_bool focused   = false;
 	std::atomic<uint64_t> presented_frames {0};
 };
 

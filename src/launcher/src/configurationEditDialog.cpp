@@ -23,6 +23,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -165,7 +166,23 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
+	// Keep the growing graphics/configuration form reachable at smaller desktop sizes.
+	m_ui->gridLayout->removeItem(m_ui->sectionsLayout);
+	auto* sections = new QWidget;
+	sections->setLayout(m_ui->sectionsLayout);
+	auto* scroll = new QScrollArea(this);
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	scroll->setWidget(sections);
+	m_ui->gridLayout->addWidget(scroll, 0, 0, 1, 2);
+	m_ui->gridLayout->setRowStretch(0, 1);
 
+	connect(m_ui->button_pipeline_list, &QPushButton::clicked, this, [this] {
+		const auto path = QFileDialog::getOpenFileName(
+		    this, tr("Select compatible pipeline list"), m_ui->lineEdit_pipeline_list->text(),
+		    tr("Kyty pipeline lists (*.kyplst)"));
+		if (!path.isEmpty()) m_ui->lineEdit_pipeline_list->setText(path);
+	});
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
@@ -320,6 +337,14 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
+	m_ui->checkBox_shader_warmup->setChecked(info.shader_warmup_enabled);
+	m_ui->checkBox_pipeline_acceleration->setChecked(info.pipeline_acceleration_enabled);
+	m_ui->checkBox_performance_diagnostics->setChecked(info.performance_diagnostics_enabled);
+	m_ui->spinBox_shader_warmup_threads->setValue(info.shader_warmup_threads);
+	m_ui->spinBox_pipeline_warmup_threads->setValue(info.pipeline_warmup_threads);
+	m_ui->spinBox_pipeline_resident_limit->setValue(info.pipeline_resident_limit);
+	m_ui->lineEdit_pipeline_list->setText(info.pipeline_list_path);
+
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
@@ -491,6 +516,13 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
+	info.shader_warmup_enabled     = ui.checkBox_shader_warmup->isChecked();
+	info.pipeline_acceleration_enabled = ui.checkBox_pipeline_acceleration->isChecked();
+	info.performance_diagnostics_enabled = ui.checkBox_performance_diagnostics->isChecked();
+	info.shader_warmup_threads = ui.spinBox_shader_warmup_threads->value();
+	info.pipeline_warmup_threads = ui.spinBox_pipeline_warmup_threads->value();
+	info.pipeline_resident_limit = ui.spinBox_pipeline_resident_limit->value();
+	info.pipeline_list_path = ui.lineEdit_pipeline_list->text().trimmed();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();

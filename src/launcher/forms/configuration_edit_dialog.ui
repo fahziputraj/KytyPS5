@@ -329,6 +329,37 @@
           <property name="text"><string>Accurate texture synchronization</string></property>
          </widget>
         </item>
+        <item row="12" column="1">
+         <widget class="QCheckBox" name="checkBox_shader_warmup">
+          <property name="toolTip"><string>Prepare recorded shaders and available graphics and compute pipelines before the game starts. Progress appears during startup. New areas and shader variants requiring live game state may still compile during play. The first run has no recorded cache to prepare.</string></property>
+          <property name="text"><string>Prepare cached shaders and pipelines before starting</string></property>
+         </widget>
+        </item>
+        <item row="13" column="1">
+         <widget class="QCheckBox" name="checkBox_pipeline_acceleration">
+          <property name="toolTip"><string>Probe the driver cache first. For new pipelines, use a quick initial compile and optimize in the background. Record pipelines for future launches and save the driver cache periodically. Does not lower rendering resolution or disable effects.</string></property>
+          <property name="text"><string>Reduce pipeline compilation stalls</string></property>
+         </widget>
+        </item>
+        <item row="14" column="1">
+         <widget class="QCheckBox" name="checkBox_performance_diagnostics">
+          <property name="toolTip"><string>Save presentation frame times and pipeline compile statistics every 10 seconds in the emulator's _Logs folder. Includes p95, p99, worst frame and hitch counts. Small diagnostic overhead.</string></property>
+          <property name="text"><string>Record frame pacing and pipeline statistics</string></property>
+         </widget>
+        </item>
+        <item row="15" column="0"><widget class="QLabel" name="label_shader_warmup_threads"><property name="text"><string>Shader workers:</string></property><property name="buddy"><cstring>spinBox_shader_warmup_threads</cstring></property></widget></item>
+        <item row="15" column="1"><widget class="QSpinBox" name="spinBox_shader_warmup_threads"><property name="toolTip"><string>Automatic uses up to 4 workers during startup. More workers can shorten preparation but use more CPU and memory.</string></property><property name="specialValueText"><string>Automatic</string></property><property name="maximum"><number>8</number></property></widget></item>
+        <item row="16" column="0"><widget class="QLabel" name="label_pipeline_warmup_threads"><property name="text"><string>Pipeline workers:</string></property><property name="buddy"><cstring>spinBox_pipeline_warmup_threads</cstring></property></widget></item>
+        <item row="16" column="1"><widget class="QSpinBox" name="spinBox_pipeline_warmup_threads"><property name="toolTip"><string>Automatic uses up to 4 startup pipeline workers. Raising this may shorten a cold preparation but can increase driver contention.</string></property><property name="specialValueText"><string>Automatic</string></property><property name="maximum"><number>16</number></property></widget></item>
+        <item row="18" column="0"><widget class="QLabel" name="label_pipeline_resident_limit"><property name="text"><string>Keep warmed pipelines:</string></property><property name="buddy"><cstring>spinBox_pipeline_resident_limit</cstring></property></widget></item>
+        <item row="18" column="1"><widget class="QSpinBox" name="spinBox_pipeline_resident_limit"><property name="toolTip"><string>Keep this many prepared graphics pipeline handles ready for direct reuse. Reduces first-use driver work, uses additional driver memory. Set to 0 to keep only the disk cache. Default: 512.</string></property><property name="specialValueText"><string>Disabled</string></property><property name="maximum"><number>2048</number></property><property name="singleStep"><number>128</number></property><property name="value"><number>512</number></property></widget></item>
+        <item row="17" column="0"><widget class="QLabel" name="label_pipeline_list"><property name="text"><string>Pipeline list:</string></property><property name="buddy"><cstring>lineEdit_pipeline_list</cstring></property></widget></item>
+        <item row="17" column="1">
+         <layout class="QHBoxLayout" name="pipelineListLayout">
+          <item><widget class="QLineEdit" name="lineEdit_pipeline_list"><property name="placeholderText"><string>Optional compatible .kyplst file</string></property><property name="toolTip"><string>A pipeline list supplies recorded variants for preparation before visiting those areas. It must match the game and version. Empty uses PipelineLists/&lt;title&gt;.kyplst when present. Your own play history is also used.</string></property></widget></item>
+          <item><widget class="QPushButton" name="button_pipeline_list"><property name="text"><string>Browse…</string></property></widget></item>
+         </layout>
+        </item>
        </layout>
       </widget>
      </item>

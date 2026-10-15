@@ -16,6 +16,7 @@ namespace Libs::Graphics {
 // prebuilt by the start-up prewarm (prewarmed). This header holds the Vulkan-free formatting.
 struct PipelineStatsValues {
 	uint64_t gfx_hit = 0, gfx_fast = 0, gfx_full = 0, gfx_other = 0, gfx_cp_ns = 0;
+	uint64_t gfx_resident = 0; // subset of gfx_hit: no driver creation call on the live draw
 	uint64_t cs_hit = 0, cs_fast = 0, cs_full = 0, cs_cp_ns = 0, cs_prewarmed = 0, rt = 0;
 	uint64_t known_misses = 0;              // probes of keys known to this PC that missed
 	uint64_t programs = 0, translations = 0, replayed = 0;
@@ -37,13 +38,14 @@ struct PipelineStatsValues {
 	char text[768];
 	std::snprintf(
 	    text, sizeof(text),
-	    "Pipelines %.0fs: gfx %llu (hit %llu, fast %llu, full %llu, other %llu) cs %llu (hit %llu, fast "
+	    "Pipelines %.0fs: gfx %llu (hit %llu, fast %llu, full %llu, other %llu; resident %llu) cs %llu (hit %llu, fast "
 	    "%llu, full %llu; prewarmed %llu) rt %llu; known-key misses %llu | CP wait %.1f ms (gfx %.1f, cs "
 	    "%.1f; all compile stalls %.1f, worst %.1f) | shaders %llu (translated %llu, replayed %llu) | bg: "
 	    "optimized %llu (%.1f ms), prewarm %llu (%.1f ms), journal %llu built %llu skipped (%.1f ms), "
 	    "unpredicted %llu",
 	    seconds, gfx, d(now.gfx_hit, before.gfx_hit), d(now.gfx_fast, before.gfx_fast),
-	    d(now.gfx_full, before.gfx_full), d(now.gfx_other, before.gfx_other), cs,
+	    d(now.gfx_full, before.gfx_full), d(now.gfx_other, before.gfx_other),
+	    d(now.gfx_resident, before.gfx_resident), cs,
 	    d(now.cs_hit, before.cs_hit), d(now.cs_fast, before.cs_fast), d(now.cs_full, before.cs_full),
 	    d(now.cs_prewarmed, before.cs_prewarmed), d(now.rt, before.rt),
 	    d(now.known_misses, before.known_misses),

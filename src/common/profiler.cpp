@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/stringUtils.h"
+#include "common/threadCpuStats.h"
 
 #include <algorithm>
 #include <array>
@@ -922,6 +923,7 @@ struct LoadingTotals {
 	std::atomic<uint64_t> completed {0};
 	std::atomic<uint64_t> in_flight {0};
 	std::atomic<uint64_t> nanoseconds {0};
+	std::atomic<uint64_t> summary_max_ns {0};
 };
 struct LoadingPlotNames {
 	const char* started;
@@ -931,6 +933,64 @@ struct LoadingPlotNames {
 };
 constexpr size_t kLoadingOperationCount = static_cast<size_t>(Profiler::LoadingOperation::Count);
 std::array<LoadingTotals, kLoadingOperationCount> g_loading_operations {};
+
+bool LoadingSummaryEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_LOADING_SUMMARY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Inclusive wall durations of calls completed in this window, not exclusive CPU/GPU time.
+// Work from different threads may overlap; a call begun earlier is attributed on completion.
+struct LoadingSummary {
+	uint64_t previous_ns = FrameWaitClockNs();
+	std::array<uint64_t, kLoadingEventCount> previous_events {};
+	std::array<uint64_t, kLoadingOperationCount> previous_calls {}, previous_times {};
+
+	void Publish(bool final = false) {
+		if (!LoadingSummaryEnabled()) return;
+		const auto now = FrameWaitClockNs();
+		if (!final && now - previous_ns < 5'000'000'000ull) return;
+		if (now <= previous_ns) return;
+		std::array<uint64_t, kLoadingEventCount> events {};
+		std::array<uint64_t, kLoadingOperationCount> calls {}, times {}, worst {};
+		for (size_t i = 0; i < events.size(); ++i) {
+			const auto value = g_loading_events[i].load(std::memory_order_relaxed);
+			events[i] = value - previous_events[i];
+			previous_events[i] = value;
+		}
+		for (size_t i = 0; i < calls.size(); ++i) {
+			const auto completed = g_loading_operations[i].completed.load(std::memory_order_relaxed);
+			const auto nanoseconds = g_loading_operations[i].nanoseconds.load(std::memory_order_relaxed);
+			calls[i] = completed - previous_calls[i];
+			times[i] = nanoseconds - previous_times[i];
+			worst[i] = g_loading_operations[i].summary_max_ns.exchange(0, std::memory_order_relaxed);
+			previous_calls[i] = completed;
+			previous_times[i] = nanoseconds;
+		}
+		using E = Profiler::LoadingEvent;
+		using O = Profiler::LoadingOperation;
+		const auto bytes = [&](E kind) { return events[static_cast<size_t>(kind)] / (1024.0 * 1024.0); };
+		const auto ms = [&](O kind) { return times[static_cast<size_t>(kind)] / 1e6; };
+		const auto count = [&](O kind) { return calls[static_cast<size_t>(kind)]; };
+		const auto max_ms = [&](O kind) { return worst[static_cast<size_t>(kind)] / 1e6; };
+		const auto active = [](O kind) {
+			return g_loading_operations[static_cast<size_t>(kind)].in_flight.load(std::memory_order_relaxed);
+		};
+		::printf("Asset loading %.1fs (completed call wall times, may overlap): APR %" PRIu64
+		         " reads %.1f MiB (host %.1f ms, copy %.1f ms, worst read %.1f ms, active %" PRIu64
+		         "); pread %" PRIu64 " reads %.1f MiB (mutex %.1f ms, coherence %.1f ms, native %.1f ms, "
+		         "worst call %.1f ms, active %" PRIu64 "); errors %" PRIu64 "\n",
+		         (now - previous_ns) / 1e9, count(O::AprRead), bytes(E::AprHostReadBytes),
+		         ms(O::AprHostRead), ms(O::AprGuestCopy), max_ms(O::AprRead), active(O::AprRead),
+		         count(O::Pread), bytes(E::PreadReadBytes), ms(O::PreadFileMutex), ms(O::PreadCoherence),
+		         ms(O::PreadNativeRead), max_ms(O::Pread), active(O::Pread),
+		         events[static_cast<size_t>(E::AprErrors)] + events[static_cast<size_t>(E::PreadErrors)]);
+		previous_ns = now;
+	}
+};
 #define KYTY_LOADING_PLOT_NAMES(name) \
     LoadingPlotNames {"Loading." #name ".Started.Cumulative", \
                       "Loading." #name ".Completed.Cumulative", \
@@ -1284,6 +1344,7 @@ void EndBlock() {
 }
 
 void SetThreadName(const char* name) {
+	if (name != nullptr) Common::ThreadCpuStats::NameCurrentThread(name);
 	if (name != nullptr) HangWatchdog::SetThreadName(name);
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
@@ -1492,12 +1553,18 @@ void ScopedLoadingOperation::End() {
 	if (!m_active) return;
 	m_active = false;
 	auto& totals = g_loading_operations[static_cast<size_t>(m_kind)];
-	totals.nanoseconds.fetch_add(FrameWaitClockNs() - m_start_ns, std::memory_order_relaxed);
+	const auto ns = FrameWaitClockNs() - m_start_ns;
+	totals.nanoseconds.fetch_add(ns, std::memory_order_relaxed);
+	if (LoadingSummaryEnabled()) {
+		auto worst = totals.summary_max_ns.load(std::memory_order_relaxed);
+		while (worst < ns && !totals.summary_max_ns.compare_exchange_weak(worst, ns, std::memory_order_relaxed)) {}
+	}
 	totals.completed.fetch_add(1, std::memory_order_relaxed);
 	totals.in_flight.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void Initialize() {
+	Common::ThreadCpuStats::Start();
 	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
 		tracy::StartupProfiler();
 		const auto* cache_policy = std::getenv("KYTY_IMAGE_CACHE_POLICY");
@@ -1544,13 +1611,14 @@ void Initialize() {
 	Detail::g_event_sink.store(Detail::CurrentEventSink(), std::memory_order_relaxed);
 	HangTrace::Initialize();
 	HangWatchdog::Initialize(HangTrace::OutputDirectory());
-	if (LoadingEnabled() && tracy::ProfilerAvailable() && !g_loading_publisher.joinable()) {
+	if (LoadingEnabled() && !g_loading_publisher.joinable()) {
 		try {
 			g_loading_publisher = std::jthread([](std::stop_token stop) {
-				tracy::SetThreadName("Loading diagnostics");
+				SetThreadName("Loading diagnostics");
 				const auto start = FrameWaitClockNs();
 				auto log = OpenLoadingLog();
 				auto apr_log = OpenLoadingLog(true);
+				LoadingSummary summary;
 				uint32_t log_rows = 0;
 				constexpr uint32_t max_log_rows = 7200;
 				std::unique_lock lock(g_loading_publish_mutex);
@@ -1559,13 +1627,18 @@ void Initialize() {
 					                       log_rows < max_log_rows;
 					PublishLoadingProgress(FrameWaitClockNs() - start, write_log ? log.get() : nullptr);
 					PublishLoadingAprSubmissions(apr_log.get());
+					summary.Publish();
 					if (write_log && ++log_rows == max_log_rows) log.reset();
 					g_loading_publish_condition.wait_for(lock, stop, std::chrono::seconds(1),
 					                                     [] { return false; });
 				}
+				if (log != nullptr && std::ferror(log.get()) == 0) {
+					PublishLoadingProgress(FrameWaitClockNs() - start, log.get());
+				}
 				PublishLoadingAprSubmissions(apr_log.get());
+				summary.Publish(true);
 			});
-			::printf("Tracy loading progress diagnostics enabled (KYTY_PROFILE_LOADING=1); "
+			::printf("Loading progress diagnostics enabled (KYTY_PROFILE_LOADING=1); "
 			         "independent one-second cumulative snapshots\n");
 		} catch (const std::exception&) {
 			::printf("Loading diagnostics publisher could not start; game startup continues\n");
@@ -1574,6 +1647,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Common::ThreadCpuStats::Stop();
 	HangWatchdog::Shutdown();
 	HangTrace::Shutdown();
 	// The publisher must finish before Tracy's global state is torn down. Its wait

@@ -16,6 +16,13 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
+	KYTY_CFG_SET(shader_warmup_enabled);
+	KYTY_CFG_SET(pipeline_acceleration_enabled);
+	KYTY_CFG_SET(performance_diagnostics_enabled);
+	KYTY_CFG_SET(shader_warmup_threads);
+	KYTY_CFG_SET(pipeline_warmup_threads);
+	KYTY_CFG_SET(pipeline_resident_limit);
+	KYTY_CFG_SET(pipeline_list_path);
 	KYTY_CFG_SET(vblank_frequency);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
@@ -61,6 +68,15 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(tessellation_enabled);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(skip_notice_screen);
+	shader_warmup_enabled = s.value("shader_warmup_enabled", shader_warmup_enabled).toBool();
+	pipeline_acceleration_enabled =
+	    s.value("pipeline_acceleration_enabled", pipeline_acceleration_enabled).toBool();
+	performance_diagnostics_enabled =
+	    s.value("performance_diagnostics_enabled", performance_diagnostics_enabled).toBool();
+	shader_warmup_threads = qBound(0, s.value("shader_warmup_threads", 0).toInt(), 8);
+	pipeline_warmup_threads = qBound(0, s.value("pipeline_warmup_threads", 0).toInt(), 16);
+	pipeline_resident_limit = qBound(0, s.value("pipeline_resident_limit", 512).toInt(), 2048);
+	pipeline_list_path = s.value("pipeline_list_path", pipeline_list_path).toString();
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

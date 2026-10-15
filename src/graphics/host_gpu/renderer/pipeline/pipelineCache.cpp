@@ -326,6 +326,7 @@ struct CompileTotals {
 	std::atomic<uint64_t> replayed {0};
 	// How pipelines were made, for the KYTY_PIPELINE_STATS line (pipelineStats.h).
 	std::atomic<uint64_t> gfx_hit {0}, gfx_fast {0}, gfx_full {0}, gfx_other {0}, gfx_cp_ns {0};
+	std::atomic<uint64_t> gfx_resident {0};
 	std::atomic<uint64_t> cs_hit {0}, cs_fast {0}, cs_full {0}, cs_cp_ns {0}, cs_prewarmed {0};
 	std::atomic<uint64_t> known_misses {0};
 	std::atomic<uint64_t> prewarm_built {0}, prewarm_ns {0};
@@ -4830,7 +4831,13 @@ struct PipelineCache::ListState {
 struct PipelineCache::JournalReplay {
 	JournalReplay(PipelineCache& owner, uint64_t verify_mode)
 	    : cache(owner), verify(verify_mode != 0), strict(verify_mode >= 2) {}
-	~JournalReplay() { Stop(); }
+	~JournalReplay() {
+		Stop();
+		for (const auto& [key, ready]: resident) {
+			cache.m_graphics.device.destroyPipeline(ready.pipeline, nullptr);
+			ReleasePipelineLayout(cache.m_graphics, ready.layout, ready.set_layout);
+		}
+	}
 	JournalReplay(const JournalReplay&)            = delete;
 	JournalReplay& operator=(const JournalReplay&) = delete;
 
@@ -4854,6 +4861,37 @@ struct PipelineCache::JournalReplay {
 		begin_ns = CompileClockNs();
 		running  = std::max<uint32_t>(1, thread_count);
 		for (uint32_t i = 0; i < running; i++) threads.emplace_back([this] { Worker(); });
+	}
+
+	struct Resident {
+		vk::Pipeline pipeline;
+		vk::PipelineLayout layout;
+		vk::DescriptorSetLayout set_layout;
+		std::vector<uint32_t> words;
+	};
+
+	// A content hash indexes candidates; compare the full serialized state before transferring
+	// ownership. The live create path has already acquired its compatible layout reference.
+	vk::Pipeline TakeResident(const GraphicsContent& content) {
+		if (resident_limit == 0 || content.key == 0) return nullptr;
+		std::scoped_lock lock(resident_mutex);
+		const auto found = resident.find(content.key);
+		if (found == resident.end() || found->second.words != content.words) return nullptr;
+		const auto pipeline = found->second.pipeline;
+		ReleasePipelineLayout(cache.m_graphics, found->second.layout, found->second.set_layout);
+		resident.erase(found);
+		resident_used.fetch_add(1, std::memory_order_relaxed);
+		g_compile_totals.gfx_resident.fetch_add(1, std::memory_order_relaxed);
+		return pipeline;
+	}
+
+	bool KeepResident(const GraphicsContent& content, vk::Pipeline pipeline,
+	                  vk::PipelineLayout layout, vk::DescriptorSetLayout set_layout) {
+		if (resident_limit == 0 || content.key == 0) return false;
+		std::scoped_lock lock(resident_mutex);
+		if (resident.size() >= resident_limit || resident.contains(content.key)) return false;
+		resident.emplace(content.key, Resident {pipeline, layout, set_layout, content.words});
+		return true;
 	}
 
 	// The boot level's records first, then the rest by rank (stable: first-needed order within one).
@@ -4887,6 +4925,11 @@ struct PipelineCache::JournalReplay {
 		}
 		threads.clear();
 		if (logged_exit.exchange(true)) return;
+		{
+			std::scoped_lock lock(resident_mutex);
+			PipelineCacheLog("Pipeline resident pool: {} reused directly; {} unused; limit {}",
+			                 resident_used.load(), resident.size(), resident_limit);
+		}
 		PipelineCacheLog("Pipeline journal: {} recorded this run; replay built {} ({} from the pipeline list; {:.1f} ms), "
 		                 "skipped {} known to the driver cache, {} with modules not published, {} failed, {} beyond "
 		                 "the driver cache limit, {} not started; {} of {} pipelines created were not in the journal "
@@ -4934,6 +4977,7 @@ struct PipelineCache::JournalReplay {
 		std::call_once(order_once, [this] {
 			BuildOrder();
 			last_report_ns = CompileClockNs();
+			PipelineCacheLog("Pipeline replay: 0/{} (0%): preparing recorded pipelines", order.size());
 		});
 		while (!stop.load(std::memory_order_acquire)) {
 			const auto index = next.fetch_add(1, std::memory_order_relaxed);
@@ -5058,6 +5102,7 @@ struct PipelineCache::JournalReplay {
 		    layouts.pipeline_layout);
 		vk::Pipeline pipeline = nullptr;
 		bool         ok       = false;
+		bool         retained = false;
 		if (snapshot != nullptr) {
 			// The rebuilt create info must describe the journaled pipeline exactly.
 			const auto check = DescribeGraphicsPipeline(snapshot->Info(), signature.subspan(0));
@@ -5086,13 +5131,16 @@ struct PipelineCache::JournalReplay {
 					if (item.from_list) built_list.fetch_add(1, std::memory_order_relaxed);
 					cache.NoteKnownPipeline(check.key);
 					cache.NotePipelineCreated(ns);
+					retained = KeepResident(check, pipeline, layouts.pipeline_layout, layouts.set_layout);
 				}
 			} else {
 				mismatched.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
-		if (pipeline != nullptr) device.destroyPipeline(pipeline, nullptr);
-		ReleasePipelineLayout(cache.m_graphics, layouts.pipeline_layout, layouts.set_layout);
+		if (!retained) {
+			if (pipeline != nullptr) device.destroyPipeline(pipeline, nullptr);
+			ReleasePipelineLayout(cache.m_graphics, layouts.pipeline_layout, layouts.set_layout);
+		}
 		unpin();
 		if (!ok) failed.fetch_add(1, std::memory_order_relaxed);
 	}
@@ -5134,6 +5182,11 @@ struct PipelineCache::JournalReplay {
 	}
 
 	PipelineCache&               cache;
+	const size_t resident_limit = static_cast<size_t>(std::min<uint64_t>(
+	    EnvU64("KYTY_PIPELINE_RESIDENT_MAX", 0), 2048));
+	std::mutex resident_mutex;
+	std::unordered_map<uint64_t, Resident> resident;
+	std::atomic<uint64_t> resident_used {0};
 	std::string                  level;
 	std::once_flag               level_once, order_once;
 	const bool                   verify;
@@ -5306,6 +5359,7 @@ void PipelineCache::InitializePipelineJournal() {
 	}
 	replay.low_priority = !prepare;
 	replay.report_ns    = prepare ? 5'000'000'000ull : 10'000'000'000ull;
+	if (EnvU64("KYTY_PIPELINE_JOURNAL_WAIT", 0) != 0) replay.report_ns = 250'000'000ull;
 	// With a pipeline list (a first start builds hundreds at once) 8: a cold spring_punch_sky_aztec
 	// stalled 5.5 s on 8 threads, 10.3 s on 4 (the level needs ~290 pipelines in its first 20 s).
 	const auto threads  = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", prepare || list ? 8 : 4), 1, 16);
@@ -5533,6 +5587,7 @@ struct PipelineCache::StatsReporter {
 		PipelineStatsValues v;
 		v.gfx_hit = get(t.gfx_hit), v.gfx_fast = get(t.gfx_fast), v.gfx_full = get(t.gfx_full);
 		v.gfx_other = get(t.gfx_other), v.gfx_cp_ns = get(t.gfx_cp_ns);
+		v.gfx_resident = get(t.gfx_resident);
 		v.cs_hit = get(t.cs_hit), v.cs_fast = get(t.cs_fast), v.cs_full = get(t.cs_full);
 		v.cs_cp_ns = get(t.cs_cp_ns), v.cs_prewarmed = get(t.cs_prewarmed);
 		v.rt           = cache.GetRtPipelineTotals().published;
@@ -5628,6 +5683,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		PipelineCacheLog("Pipeline prefetch: {} compile workers; draws always wait for their exact pipeline", threads);
 	}
 	if (EnvU64("KYTY_PIPELINE_STATS", 0) != 0) m_stats_reporter = std::make_unique<StatsReporter>(*this);
+	if (EnvU64("KYTY_PIPELINE_PREWARM_WAIT", 0) != 0) {
+		// A PC-style startup barrier: replayed compute and software RT kernels are also ready
+		// before the guest starts. Live-state-only variants remain a runtime compilation.
+		PipelineCacheLog("Pipeline warmup: waiting for recorded compute and ray-tracing kernels");
+		if (m_shader_precompiler != nullptr) m_shader_precompiler->Wait();
+		if (m_compute_prewarm != nullptr) m_compute_prewarm->Drain();
+		if (m_rt != nullptr) m_rt->WaitAll();
+		PipelineCacheLog("Pipeline warmup: ready");
+	}
 	if (EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0 && !PipelineCacheTitleId().empty()) RunListPrepare();
 }
 
@@ -5650,6 +5714,7 @@ PipelineCache::~PipelineCache() {
 	}
 	Save();
 	m_prefetch.reset(); // Unused speculative pipelines before layouts and program modules.
+	m_journal_replay.reset(); // Resident handles/layout references precede interned layout teardown.
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -7234,12 +7299,26 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
 			if (keyed) content = DescribeGraphicsPipeline(info, layout_signature);
+			if (m_journal_replay != nullptr) {
+				if (auto resident = m_journal_replay->TakeResident(content)) {
+					*pipeline = resident;
+					fast_result.cache_hit = true;
+					return vk::Result::eSuccess;
+				}
+			}
 			return m_fast_first->CreateGraphics(info, content, pipeline, fast_result);
 		};
 	} else if (keyed && !prefetched) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
 			content           = DescribeGraphicsPipeline(info, layout_signature);
+			if (m_journal_replay != nullptr) {
+				if (auto resident = m_journal_replay->TakeResident(content)) {
+					*pipeline = resident;
+					fast_result.cache_hit = true;
+					return vk::Result::eSuccess;
+				}
+			}
 			const auto result = m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &info, nullptr, pipeline);
 			if (result == vk::Result::eSuccess) NoteKnownPipeline(content.key);
 			return result;

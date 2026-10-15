@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/framePacingStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -328,6 +330,7 @@ struct Presenter::Impl {
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
+		frame_stats.Reset();
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
@@ -356,7 +359,26 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
-	void Present();
+	void Present(bool guest_frame = false);
+
+	void RecordFrame() {
+		if (!frame_stats_enabled) return;
+		const bool focused = window.loop.focused.load(std::memory_order_relaxed);
+		if (frame_stats_focused != focused) {
+			frame_stats.Reset();
+			frame_stats_focused = focused;
+		}
+		const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::steady_clock::now().time_since_epoch()).count());
+		if (const auto r = frame_stats.Present(now)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Frame pacing {:.1f}s: {:.1f} FPS, {} presented game frames | p50 {:.2f} ms, p95 {:.2f} ms, "
+			    "p99 {:.2f} ms, worst {:.2f} ms | over 33/50/100 ms: {}/{}/{} | {}\n",
+			    r->seconds, r->fps, r->frames, r->p50_ms, r->p95_ms, r->p99_ms, r->worst_ms,
+			    r->over_33_ms, r->over_50_ms, r->over_100_ms,
+			    focused ? "foreground" : "background"));
+		}
+	}
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -366,6 +388,12 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	const bool frame_stats_enabled = [] {
+		const auto* setting = std::getenv("KYTY_FRAME_STATS");
+		return setting != nullptr && std::strcmp(setting, "1") == 0;
+	}();
+	Common::FramePacingStats frame_stats;
+	bool frame_stats_focused = false;
 };
 
 /// Creates the Vulkan swapchain for the current window surface.
@@ -1271,12 +1299,12 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
-void Presenter::Present(Frame& frame) {
+void Presenter::Present(Frame& frame, bool guest_frame) {
 	const Layer layer {&frame, 0, false};
-	Present(std::span(&layer, 1));
+	Present(std::span(&layer, 1), guest_frame);
 }
 
-void Presenter::Present(std::span<const Layer> layers) {
+void Presenter::Present(std::span<const Layer> layers, bool guest_frame) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
@@ -1287,7 +1315,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
-	m_impl->Present();
+	m_impl->Present(guest_frame);
 }
 
 void Presenter::ClearLayer(int bus) {
@@ -1302,7 +1330,7 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present() {
+void Presenter::Impl::Present(bool guest_frame) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
@@ -1311,11 +1339,13 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	if (swapchain.IsMinimized()) {
+		frame_stats.Reset();
 		return;
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status == Swapchain::Status::Minimized) {
+			frame_stats.Reset();
 			return;
 		}
 		if (status != Swapchain::Status::Success) {
@@ -1344,6 +1374,7 @@ void Presenter::Impl::Present() {
 		}
 		status = swapchain.Present();
 		if (status == Swapchain::Status::Minimized) {
+			frame_stats.Reset();
 			return;
 		}
 		if (status != Swapchain::Status::Success) {
@@ -1356,6 +1387,11 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		if (window.loop.paused.load(std::memory_order_acquire)) {
+			frame_stats.Reset();
+		} else if (guest_frame) {
+			RecordFrame();
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

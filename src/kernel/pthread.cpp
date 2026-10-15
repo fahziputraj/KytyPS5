@@ -14,6 +14,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/threadCpuStats.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
 #include "kernel/pendingSignals.h"
@@ -579,6 +580,7 @@ static Live::Switch g_precise_cond_waits("KYTY_PRECISE_COND_WAITS", Live::ParseD
 template <class Lock, class Ready>
 static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
                           std::chrono::steady_clock::time_point deadline) {
+	Common::ThreadCpuStats::GuestConditionWait activity;
 	Common::CondWaitUntil(lock, cv, ready, deadline, SIGNAL_APC_POLL_MICROS,
 	                      g_precise_cond_waits.On(),
 	                      [] { KernelDispatchPendingSignalForCurrentThread(); });
@@ -618,36 +620,53 @@ static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
 	return true;
 }
 
+// A long sleep is split so pending signals can be dispatched. Measure elapsed wall time from
+// one origin: subtracting only each requested slice adds every timer overshoot and signal
+// handler's cost to the guest's timeout. Short sleeps retain their existing fast path.
+template <class Duration, class Sleep>
+static void SleepWithSignalPoll(uint64_t requested, uint64_t poll, Sleep&& sleep) {
+	if (requested <= poll) {
+		sleep(requested);
+		KernelDispatchPendingSignalForCurrentThread();
+		return;
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	auto remaining = requested;
+	while (remaining != 0) {
+		sleep(std::min(remaining, poll));
+		KernelDispatchPendingSignalForCurrentThread();
+		const auto elapsed = static_cast<uint64_t>(
+		    std::chrono::duration_cast<Duration>(std::chrono::steady_clock::now() - begin).count());
+		remaining = elapsed < requested ? requested - elapsed : 0;
+	}
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
+	Common::ThreadCpuStats::RecordGuestSleep(microseconds > UINT64_MAX / 1000 ? UINT64_MAX : microseconds * 1000);
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
 
-	while (microseconds > 0) {
-		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
+	SleepWithSignalPoll<std::chrono::microseconds>(microseconds, SIGNAL_APC_POLL_MICROS, [](uint64_t step) {
 		// KYTY_SHORT_SLEEP_BLOCK=1 (common/threads.h): every step blocks on the host timer.
 		if (Common::ShortSleepsBlock() || !SleepMicroSchedulerBackoff(step)) {
 			Common::Thread::SleepMicro(step);
 		}
-		microseconds -= step;
-		KernelDispatchPendingSignalForCurrentThread();
-	}
+	});
 }
 
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
+	Common::ThreadCpuStats::RecordGuestSleep(nanoseconds);
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
 
 	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
-	while (nanoseconds > 0) {
-		const auto step = std::min<uint64_t>(nanoseconds, poll_nanos);
+	SleepWithSignalPoll<std::chrono::nanoseconds>(nanoseconds, poll_nanos, [](uint64_t step) {
 		Common::Thread::SleepNano(step);
-		nanoseconds -= step;
-		KernelDispatchPendingSignalForCurrentThread();
-	}
+	});
 }
 
 struct PthreadStaticObject {
@@ -1183,6 +1202,7 @@ void PthreadInitSelfForMainThread() {
 	g_pthread_self->p               = pthread_self();
 	g_pthread_self->name            = "MainThread";
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(g_pthread_self), "MainThread");
+	Common::ThreadCpuStats::NameCurrentThread("Guest:MainThread");
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
 	g_pthread_self->free            = false;
@@ -3362,6 +3382,7 @@ static void* RunThread(void* arg) {
 
 	g_pthread_self = thread;
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
+	Common::ThreadCpuStats::NameCurrentThread("Guest:" + thread->name);
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3785,6 +3806,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	Common::ThreadCpuStats::RecordGuestYield();
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
 	if ((++placement_yields & 4095u) == 0u) {
