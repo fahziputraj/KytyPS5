@@ -117,17 +117,32 @@ keeps the old blit. HDR frames keep the blit. To use it on a 1440p monitor set t
 resolution to 2560x1440 or use fullscreen. The FSR 1 shader headers are MIT licensed
 (`src/graphics/host_gpu/shaders/ffx`, `LICENSES/FidelityFX-SDK-MIT.txt`).
 
-## Frame generation: NVIDIA Smooth Motion (keep it off for now)
+## Anti-aliasing: 4K supersampling (instead of DLAA / FSR Native AA)
+
+DLAA and FSR Native AA are temporal: they need the game's per-pixel motion vectors, depth and
+camera jitter, which an emulator cannot obtain in general. The anti-aliasing that does work is
+supersampling: launcher resolution **3840x2160** with **Fullscreen** on. The emulator then reports
+a 4K output, games such as ASTRO BOT render 4K frames, and the presenter shrinks them to the
+screen with a box filter (`KYTY_PRESENT_BOX_DOWNSCALE=1`, now in the preset; it averages the
+pixels instead of the aliasing bilinear blit).
+
+Measured on ASTRO BOT, RTX 5070 Ti, 2560x1440 screen: 37-60 flips/s with 4K output against 32-56
+with 1080p output on the same route; GPU load stayed around 40-50%. The frame rate is set by the
+CPU side of the emulator, so the extra GPU work is nearly free on this PC. With 1080p output in
+fullscreen the frame is upscaled with FSR 1 instead.
+
+## Frame generation: NVIDIA Smooth Motion
 
 Game-integrated frame generation (FSR 3, DLSS FG) needs the game's motion vectors, which an
 emulator cannot obtain in general. NVIDIA Smooth Motion (RTX 50 driver frame generation, NVIDIA
 App > Graphics > Program Settings > `kyty_emulator.exe`) can start for the emulator, which
-initializes CUDA early for it (`CUDA: initialized ... (cuInit 0)` in the log).
+initializes CUDA early for it (`CUDA: initialized ... (cuInit 0)` in the log). Its driver layer
+logs to `C:/NvPresent/logs` when it runs for a program.
 
-**Tested 2026-10-18 (driver 617.42, ASTRO BOT PPSA21567): with Smooth Motion on, the game stays on a
-black screen at boot** (it runs at 60 FPS but never starts its intro video), in this build and in
-the older int19.1 build alike. With Smooth Motion off the same setup boots into play. Leave it off
-for `kyty_emulator.exe` until a driver or emulator change makes the two compatible.
+On 2026-10-18 ASTRO BOT (PPSA21567) hung on a black boot screen (60 FPS, intro video never
+started) in every run for about 40 minutes, including the older int19.1 build and runs without a
+save or caches; before and after that the same setups booted into play, also with Smooth Motion
+on. The cause was not found. If it happens, close and restart the emulator.
 
 ## Accuracy
 
