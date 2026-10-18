@@ -7,16 +7,22 @@
 #include "kernel/memory.h"
 #include "loader/elf.h"
 #include "loader/gamePatchFilter.h"
+#include "loader/simulationClock.h"
+#include "loader/simulationClockProfile.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,12 +47,23 @@ struct Plan {
 	std::vector<Write>       writes;
 	std::vector<std::string> mod_names;
 	std::vector<uint64_t>    cave_pages;
+	// A title's own timestep, bound by a byte-guarded patch (simulationClockProfile.h), and the
+	// presentation limit paired with it.
+	uint32_t                              presentation_fps = 0;
+	std::optional<SimulationClockProfile> simulation_clock;
 };
 
 using Json = nlohmann::json;
 
 std::unique_ptr<Plan> g_pending_plan;
 std::vector<uint64_t> g_applied_cave_pages;
+
+std::atomic<uint32_t>   g_presentation_fps {0};
+std::atomic<bool>       g_simulation_active {false};
+std::mutex              g_simulation_mutex;
+std::vector<ClockField> g_simulation_fields;
+uint64_t                g_simulation_previous = 0;
+SimulationClock         g_simulation_clock;
 
 bool Fail(std::string* error, std::string message) {
 	*error = std::move(message);
@@ -120,6 +137,22 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		}
 		const auto name = mod["name"].get<std::string>();
 		plan->mod_names.push_back(name);
+		if (mod.contains("simulation_clock")) {
+			SimulationClockProfile profile;
+			if (plan->simulation_clock.has_value() ||
+			    !ParseSimulationClockProfile(mod["simulation_clock"], profile)) {
+				return Fail(error, "invalid or conflicting simulation clock");
+			}
+			plan->simulation_clock = std::move(profile);
+		}
+		if (mod.contains("presentation_fps")) {
+			const auto& fps = mod["presentation_fps"];
+			if (!fps.is_number_unsigned() || fps.get<uint64_t>() == 0 || fps.get<uint64_t>() > 240 ||
+			    (plan->presentation_fps != 0 && plan->presentation_fps != fps.get<uint32_t>())) {
+				return Fail(error, "invalid or conflicting mod presentation_fps");
+			}
+			plan->presentation_fps = fps.get<uint32_t>();
+		}
 		for (const auto& entry: mod["memory"]) {
 			Write write;
 			write.source_address = std::stoull(entry["offset"].get<std::string>(), nullptr, 16);
@@ -129,6 +162,19 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 				return Fail(error, "invalid mod memory bytes");
 			}
 			plan->writes.push_back(std::move(write));
+		}
+	}
+	if (plan->simulation_clock.has_value()) {
+		const auto& profile = *plan->simulation_clock;
+		for (const auto& field: profile.fields) {
+			if (std::none_of(plan->writes.begin(), plan->writes.end(), [&](const Write& write) {
+				    return IsClockFieldGuarded(field, write.source_address, write.off);
+			    })) {
+				return Fail(error, "every simulation clock field requires an original-byte guard");
+			}
+		}
+		if (plan->presentation_fps != static_cast<uint32_t>(std::ceil(profile.nominal_fps))) {
+			return Fail(error, "simulation clock requires a presentation limit matching its nominal rate");
 		}
 	}
 	return true;
@@ -329,12 +375,62 @@ bool ApplyPending(Program* program) {
 	for (const auto& name: g_pending_plan->mod_names) {
 		::printf("Successfully applied cheat: %s\n", name.c_str());
 	}
+	if (g_pending_plan->simulation_clock.has_value()) {
+		std::lock_guard lock(g_simulation_mutex);
+		const auto&     profile = *g_pending_plan->simulation_clock;
+		g_simulation_fields     = profile.fields;
+		for (auto& field: g_simulation_fields) {
+			Translate(*program, source_base, field.address, &field.address);
+		}
+		g_simulation_previous = 0;
+		EXIT_IF(!g_simulation_clock.Configure(profile.nominal_fps, profile.minimum_fps));
+		g_simulation_active.store(true, std::memory_order_release);
+		Log::WriteToConsoleAndLog(fmt::format("Game simulation clock: adaptive {:.2f}-to-{:.2f} FPS, {} guarded field(s)\n",
+		                                      profile.nominal_fps, profile.minimum_fps, profile.fields.size()));
+	}
+	if (g_pending_plan->presentation_fps != 0) {
+		g_presentation_fps.store(g_pending_plan->presentation_fps, std::memory_order_relaxed);
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Game patch: paired presentation limit {} FPS\n", g_pending_plan->presentation_fps));
+	}
 	g_applied_cave_pages = std::move(g_pending_plan->cave_pages);
 	g_pending_plan.reset();
 	return true;
 }
 
+uint32_t PresentationFpsLimit() {
+	return g_presentation_fps.load(std::memory_order_relaxed);
+}
+
+// The pace maintainer, when a main-output flip is presented and before its completion releases
+// the guest: the title's timestep follows the real frame period (SimulationClock).
+void OnPresentedFrame(uint64_t now, uint64_t frequency) {
+	if (!g_simulation_active.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard lock(g_simulation_mutex);
+	if (g_simulation_fields.empty() || frequency == 0) {
+		return;
+	}
+	const double elapsed  = g_simulation_previous != 0 && now > g_simulation_previous
+	                            ? static_cast<double>(now - g_simulation_previous) / static_cast<double>(frequency)
+	                            : 0.0;
+	g_simulation_previous = now;
+	const auto step       = g_simulation_clock.Advance(elapsed);
+	for (const auto& field: g_simulation_fields) {
+		StoreClockStep(field, step);
+	}
+}
+
 void Clear() {
+	{
+		std::lock_guard lock(g_simulation_mutex);
+		g_simulation_active.store(false, std::memory_order_release);
+		g_simulation_fields.clear();
+		g_simulation_previous = 0;
+		g_simulation_clock.Reset();
+	}
+	g_presentation_fps.store(0, std::memory_order_relaxed);
 	if (g_pending_plan != nullptr) {
 		ReleaseCaves(&g_pending_plan->cave_pages);
 	}

@@ -1,0 +1,27 @@
+{
+  "id": "PPSA21567",
+  "name": "ASTRO BOT 01.019 experimental 30 FPS clock",
+  "version": "01.019.000",
+  "process": "eboot.bin",
+  "source_sha256": "e88e19a688289e1ea557a6100b9b7d89fb3041875a7aa8471b361bfedf59fa86",
+  "mods": [
+    {
+      "name": "30 FPS engine timestep with guarded setter",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "08FF0040",
+          "off": "0000000000004e408988883c000000001a41000000000000",
+          "on": "0000000000003e408988083d000000003582000000000000"
+        },
+        {
+          "offset": "000034C0",
+          "off": "c5fb100dc0913408c5fb1015208c3408c5fb110568cbfe08c5f35ec8c5eb5ec0c4e1fb2cc1c5f35c0d8b8c3408c5fb5ac04889c1c5fa11054ccbfe0848c1f93fc4e1fb2cd14821ca4809c24889153ecbfe08c3cccccccccccccccccccccccccc",
+          "on": "c5fb100578cbfe08c5fb100db8913408c5fb1015188c3408c5fb110560cbfe08c5f35ec8c5eb5ec0c4e1fb2cc1c5f35c0d838c3408c5fb5ac04889c1c5fa110544cbfe0848c1f93fc4e1fb2cd14821ca4809c248891536cbfe08c3cccccccccc"
+        }
+      ],
+      "id": "codex.astro.clock30",
+      "presentation_fps": 30
+    }
+  ]
+}

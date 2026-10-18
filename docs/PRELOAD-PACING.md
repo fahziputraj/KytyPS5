@@ -80,6 +80,25 @@ emulator delivers fewer frames than the game's target rate (for example 45 FPS a
 emulator-side clock can fix that without the game's cooperation; it needs a faster frame or a
 title-specific clock patch.
 
+## Keeping ASTRO BOT's speed: adaptive game clock (title patch)
+
+ASTRO BOT advances its world one fixed 1/60 s step per frame, so below 60 FPS (Sky Garden drops to
+the 30s in some views) it plays in slow motion however the frames are presented. A title patch
+fixes that: `patches/PPSA21567-01.019-clock-adaptive.json` (made for the installed version
+01.019; eboot SHA-256 `e88e19a6...`, checked against the original bytes before any write) binds
+the game's frame rate, seconds-per-step and microseconds-per-step values, and the emulator sets
+them from the measured frame period on every presented main-output frame (`simulation_clock`,
+src/loader/simulationClock.h): between 60 and 30 FPS the world advances by the real elapsed time,
+smoothed over about 80 ms, with timing debt repaid over about 600 ms; stalls over 250 ms reset it
+instead of fast-forwarding. Below 30 FPS it still slows down.
+
+The launcher applies `_Patches/PPSA21567.json` beside it (installed in F:/KytyPS5-Build with the
+adaptive clock; turn it off in the launcher's cheats/patches dialog). `-clock30.json` is the fixed
+30 FPS alternative: it also caps presentation at 30 (`presentation_fps`, honoured by the pace
+maintainer), so the game never runs double speed with the 1/30 s step. The log shows
+`Game simulation clock: adaptive 60.00-to-30.00 FPS, 3 guarded field(s)` when it is active.
+Other games and versions need their own verified patch.
+
 ## Scheduling (`KYTY_HYBRID_PLACEMENT`, `KYTY_ECOQOS`)
 
 - Windows 11 puts a background or covered window's process on EcoQoS (E-cores, lower clocks) and
@@ -117,19 +136,16 @@ keeps the old blit. HDR frames keep the blit. To use it on a 1440p monitor set t
 resolution to 2560x1440 or use fullscreen. The FSR 1 shader headers are MIT licensed
 (`src/graphics/host_gpu/shaders/ffx`, `LICENSES/FidelityFX-SDK-MIT.txt`).
 
-## Anti-aliasing: 4K supersampling (instead of DLAA / FSR Native AA)
+## Anti-aliasing (DLAA / FSR Native AA)
 
-DLAA and FSR Native AA are temporal: they need the game's per-pixel motion vectors, depth and
-camera jitter, which an emulator cannot obtain in general. The anti-aliasing that does work is
-supersampling: launcher resolution **3840x2160** with **Fullscreen** on. The emulator then reports
-a 4K output, games such as ASTRO BOT render 4K frames, and the presenter shrinks them to the
-screen with a box filter (`KYTY_PRESENT_BOX_DOWNSCALE=1`, now in the preset; it averages the
-pixels instead of the aliasing bilinear blit).
+DLAA and FSR Native AA are temporal: they replace the game's own TAA and need its per-pixel motion
+vectors, depth and camera jitter, which an emulator cannot obtain in general. They are not
+available. The games keep their own anti-aliasing.
 
-Measured on ASTRO BOT, RTX 5070 Ti, 2560x1440 screen: 37-60 flips/s with 4K output against 32-56
-with 1080p output on the same route; GPU load stayed around 40-50%. The frame rate is set by the
-CPU side of the emulator, so the extra GPU work is nearly free on this PC. With 1080p output in
-fullscreen the frame is upscaled with FSR 1 instead.
+4K output downscaled to the screen (launcher resolution 3840x2160 with fullscreen) is possible as
+supersampling, but in play on ASTRO BOT (RTX 5070 Ti, i5-13500) it lowered the frame rate and, with
+the game's per-frame timestep, slowed the game down. Keep 1920x1080. `KYTY_PRESENT_BOX_DOWNSCALE=1`
+(in the preset) only affects frames larger than the window.
 
 ## Frame generation: NVIDIA Smooth Motion
 

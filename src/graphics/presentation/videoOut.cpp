@@ -25,6 +25,7 @@
 #include "kernel/eventQueueFilters.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/gamePatch.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
@@ -230,6 +231,8 @@ public:
 	struct Pacing {
 		int64_t now    = 0; // performance counter
 		int64_t period = 1; // one vblank, in performance counter ticks
+		// A timing patch's presentation limit as a minimum flip interval (0: none).
+		int64_t min_interval = 0;
 	};
 	bool Flip(uint32_t micros, const Pacing* pacing = nullptr);
 	// Whether the next flip group is complete (every request Ready); `due` is then its port's
@@ -531,7 +534,7 @@ static bool IsPacedFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation,
 // an interval, so on average the port never flips faster than its flip rate allows, while a frame
 // that came late does not delay the next one by a whole interval.
 static void AdvancePacedFlipLocked(VideoOutConfig& cfg, const FlipQueue::Pacing& pacing) {
-	const int64_t interval = static_cast<int64_t>(cfg.flip_rate + 1) * pacing.period;
+	const int64_t interval = std::max(static_cast<int64_t>(cfg.flip_rate + 1) * pacing.period, pacing.min_interval);
 	cfg.paced_next_flip    = cfg.paced_next_flip == 0
 	                             ? pacing.now + interval
 	                             : std::max(cfg.paced_next_flip + interval, pacing.now + interval / 2);
@@ -973,6 +976,9 @@ void VideoOutDriver::Impl::PacedPresentThread(const std::stop_token& token) {
 			origin     = now_qpc() - static_cast<int64_t>(ticks) * period;
 		}
 		const int64_t deadline  = origin + static_cast<int64_t>(ticks + 1) * period;
+		// A timing patch's paired presentation limit (gamePatch.h), e.g. 30 for a 30 FPS game clock.
+		const auto    cap_fps      = Loader::GamePatch::PresentationFpsLimit();
+		const int64_t cap_interval = cap_fps != 0 ? frequency / cap_fps : 0;
 		bool          presented = false;
 		// A ready group Flip declined (its port is closing): retried at the tick, not in a spin.
 		bool blocked = false;
@@ -986,7 +992,7 @@ void VideoOutDriver::Impl::PacedPresentThread(const std::stop_token& token) {
 			int64_t    due   = 0;
 			const bool ready = vrr && !blocked && m_flip_queue.ReadyFlipDue(due);
 			if (ready && now >= due) {
-				const FlipQueue::Pacing pacing {now, period};
+				const FlipQueue::Pacing pacing {now, period, cap_interval};
 				if (m_flip_queue.Flip(0, &pacing)) {
 					presented = true;
 					note_flip(now, true);
@@ -1025,7 +1031,7 @@ void VideoOutDriver::Impl::PacedPresentThread(const std::stop_token& token) {
 			// Only a due group: Flip would otherwise wait up to a millisecond for a submission.
 			int64_t due = 0;
 			if (m_flip_queue.ReadyFlipDue(due) && now >= due) {
-				const FlipQueue::Pacing pacing {now, period};
+				const FlipQueue::Pacing pacing {now, period, cap_interval};
 				if (m_flip_queue.Flip(0, &pacing)) {
 					presented = true;
 					note_flip(now, false);
@@ -1509,6 +1515,14 @@ bool FlipQueue::Flip(uint32_t micros, const Pacing* pacing) {
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
+		// A timing patch's timestep follows the presented main-output frames, before the flip
+		// completes for the guest.
+		if (std::any_of(layers.begin(), layers.begin() + count, [](const auto& layer) {
+			    return layer.bus == VIDEO_OUT_BUS_TYPE_MAIN;
+		    })) {
+			Loader::GamePatch::OnPresentedFrame(Common::Timer::QueryPerformanceCounter(),
+			                                    Common::Timer::QueryPerformanceFrequency());
+		}
 	}
 
 	m_mutex.Lock();

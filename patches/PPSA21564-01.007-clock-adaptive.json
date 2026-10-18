@@ -1,0 +1,36 @@
+{
+  "id": "PPSA21564",
+  "name": "ASTRO BOT 01.007 experimental adaptive simulation clock",
+  "version": "01.007.000",
+  "process": "eboot.bin",
+  "source_sha256": "3b5100797fe83663e18a650f82f901d066acf1029ae80cfb1be638fe0839debd",
+  "mods": [
+    {
+      "name": "Adaptive 30-60 FPS engine timestep with guarded setter",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "08FD4040",
+          "off": "0000000000004e408988883c000000001a41000000000000",
+          "on": "0000000000004e408988883c000000001a41000000000000"
+        },
+        {
+          "offset": "000034C0",
+          "off": "c5fb100d48d63408c5fb1015b0d03408c5fb1105680bfd08c5f35ec8c5eb5ec0c4e1fb2cc1c5f35c0d1bd13408c5fb5ac04889c1c5fa11054c0bfd0848c1f93fc4e1fb2cd14821ca4809c24889153e0bfd08c3cccccccccccccccccccccccccc",
+          "on": "c5fb1005780bfd08c5fb100d40d63408c5fb1015a8d03408c5fb1105600bfd08c5f35ec8c5eb5ec0c4e1fb2cc1c5f35c0d13d13408c5fb5ac04889c1c5fa1105440bfd0848c1f93fc4e1fb2cd14821ca4809c2488915360bfd08c3cccccccccc"
+        }
+      ],
+      "id": "codex.astro.clock-adaptive",
+      "presentation_fps": 60,
+      "simulation_clock": {
+        "nominal_fps": 60,
+        "minimum_fps": 30,
+        "fields": [
+          { "offset": "08FD4040", "value": "rate_f64" },
+          { "offset": "08FD4048", "value": "seconds_f32" },
+          { "offset": "08FD4050", "value": "microseconds_u64" }
+        ]
+      }
+    }
+  ]
+}
