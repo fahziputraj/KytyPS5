@@ -325,6 +325,10 @@ public:
 	// Returns once the shader precompile replay (KYTY_SHADER_PRECOMPILE, shaderPrecompile.h) has
 	// replayed every journal entry (tests); at once when it is off. The journal is also written.
 	void WaitShaderPrecompile();
+	// KYTY_SHADER_PRELOAD: returns once the start-up replays are done (or skipped), publishing their
+	// progress for the overlay (common/shaderPreloadStatus.h); at once when there is nothing to
+	// preload or after the first call. The guest's first thread calls it (WaitForShaderPreload).
+	void WaitShaderPreload();
 	// Diagnostic only; skips busy cache locks instead of waiting for compiles/preparation.
 	void ReportRamStats();
 
@@ -414,6 +418,17 @@ private:
 	// Background builds of every replayed compute program's pipeline (KYTY_PIPELINE_PREWARM_COMPUTE).
 	struct ComputePrewarm;
 	std::unique_ptr<ComputePrewarm> m_compute_prewarm;
+	// Graphics pipelines the shader preload's replay built, until a draw takes them (KYTY_SHADER_PRELOAD);
+	// null when off.
+	struct ResidentPipelines;
+	std::unique_ptr<ResidentPipelines> m_resident;
+	// A start-up replay runs that the game is to wait for (WaitShaderPreload).
+	std::atomic<bool> m_preload_pending {false};
+	// From then until WaitShaderPreload is done: background builds started meanwhile (the RT
+	// kernels') run at full speed, the game waits for them.
+	std::atomic<bool> m_preloading {false};
+	// m_rt is set (Rt() ran): other threads may read it.
+	std::atomic<bool> m_rt_ready {false};
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;

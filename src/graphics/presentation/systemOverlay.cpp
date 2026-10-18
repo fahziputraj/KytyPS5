@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/localization.h"
 #include "common/logging/log.h"
+#include "common/shaderPreloadStatus.h"
 #include "common/stringUtils.h"
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -709,14 +710,30 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
+	const bool preload       = Common::ShaderPreload::Active();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            (cursor.enabled && cursor.cursor_visible),
+	            (cursor.enabled && cursor.cursor_visible) || preload,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision)};
+	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
+	            Common::ShaderPreload::Revision() * 4u};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
+	// The shader preload screen (KYTY_SHADER_PRELOAD): the game is not running yet, so its keys and
+	// buttons only skip the rest of the wait.
+	if (Common::ShaderPreload::Active()) {
+		if (event.type == SDL_EVENT_KEY_DOWN && event.key.repeat == 0 &&
+		    (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)) {
+			Common::ShaderPreload::RequestSkip();
+			return true;
+		}
+		if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+		    (event.gbutton.button == SDL_GAMEPAD_BUTTON_START || event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH)) {
+			Common::ShaderPreload::RequestSkip();
+			return true;
+		}
+	}
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
 		VisibilityUpdate update {};
 		{
@@ -1093,6 +1110,64 @@ struct SystemOverlay::Impl {
 			    splash_dds[i]->Texture(), begin, end, {0, 0}, {1, 1},
 			    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * (i == 0 ? 1.0f : logo))));
 		}
+	}
+
+	// KYTY_SHADER_PRELOAD: the "Preparing shaders" panel while the game waits for the start-up
+	// replays (over the splash when the game has one).
+	void DrawShaderPreload(vk::Extent2D frame_extent) {
+		const auto state = Common::ShaderPreload::Get();
+		if (!state.active) {
+			return;
+		}
+		const ImVec2 screen {static_cast<float>(frame_extent.width), static_cast<float>(frame_extent.height)};
+		const float  scale = std::clamp(std::min(screen.x / 1920.0f, screen.y / 1080.0f), 0.5f, 2.0f);
+		auto*        draw  = ImGui::GetForegroundDrawList();
+		if (!g_splash_active.load(std::memory_order_acquire)) {
+			draw->AddRectFilled({0, 0}, screen, IM_COL32(8, 10, 16, 255));
+		}
+		const char* phase = "Preparing";
+		switch (state.phase) {
+			case Common::ShaderPreload::Phase::Shaders: phase = "Compiling shaders"; break;
+			case Common::ShaderPreload::Phase::Compute: phase = "Building compute pipelines"; break;
+			case Common::ShaderPreload::Phase::RayTracing: phase = "Building ray-tracing pipelines"; break;
+			case Common::ShaderPreload::Phase::Pipelines: phase = "Building graphics pipelines"; break;
+			default: break;
+		}
+		const float fraction =
+		    state.all_total != 0
+		        ? std::clamp(static_cast<float>(state.all_done) / static_cast<float>(state.all_total), 0.0f, 1.0f)
+		        : 0.0f;
+		const auto now_ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+		        .count());
+		const auto elapsed_s = now_ns > state.begin_ns ? (now_ns - state.begin_ns) / 1'000'000'000ull : 0;
+
+		const float  width   = std::min(screen.x - 48.0f * scale, 760.0f * scale);
+		const float  height  = 150.0f * scale;
+		const ImVec2 begin {(screen.x - width) * 0.5f, screen.y - height - 72.0f * scale};
+		const ImVec2 end {begin.x + width, begin.y + height};
+		const float  pad = 24.0f * scale;
+		draw->AddRectFilled(begin, end, IM_COL32(18, 20, 28, 232), 14.0f * scale);
+		draw->AddRect(begin, end, IM_COL32(255, 255, 255, 28), 14.0f * scale, 0, 1.0f * scale);
+
+		const auto title = fmt::format("Preparing shaders  {:.0f}%", fraction * 100.0f);
+		draw->AddText(nullptr, 28.0f * scale, {begin.x + pad, begin.y + pad * 0.8f}, IM_COL32(240, 242, 248, 255),
+		              title.c_str());
+		const auto detail = state.total != 0 ? fmt::format("{}  {} / {}    {}:{:02}", phase, state.done, state.total,
+		                                                   elapsed_s / 60, elapsed_s % 60)
+		                                     : fmt::format("{}    {}:{:02}", phase, elapsed_s / 60, elapsed_s % 60);
+		draw->AddText(nullptr, 19.0f * scale, {begin.x + pad, begin.y + pad * 0.8f + 38.0f * scale},
+		              IM_COL32(176, 182, 196, 255), detail.c_str());
+
+		const ImVec2 bar_begin {begin.x + pad, begin.y + 92.0f * scale};
+		const ImVec2 bar_end {end.x - pad, bar_begin.y + 10.0f * scale};
+		draw->AddRectFilled(bar_begin, bar_end, IM_COL32(255, 255, 255, 30), 5.0f * scale);
+		if (fraction > 0.0f) {
+			draw->AddRectFilled(bar_begin, {bar_begin.x + (bar_end.x - bar_begin.x) * fraction, bar_end.y},
+			                    IM_COL32(72, 146, 255, 255), 5.0f * scale);
+		}
+		draw->AddText(nullptr, 15.0f * scale, {begin.x + pad, bar_end.y + 12.0f * scale}, IM_COL32(128, 134, 148, 255),
+		              "Esc / Enter or Options / Cross: start now and finish the rest in the background");
 	}
 
 	void EnsureVulkan(vk::Format format, uint32_t image_count) {
@@ -1799,7 +1874,7 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled) {
+		    !GetHostInputTouchPadVisualState().enabled && !Common::ShaderPreload::Active()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1830,6 +1905,7 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		DrawSplash(frame_extent);
+		DrawShaderPreload(frame_extent);
 		GetOverlaySnapshot(&snapshot);
 		if (has_overlay && snapshot.session == prepared_session) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {

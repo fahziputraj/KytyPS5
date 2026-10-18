@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -197,6 +199,9 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	// KYTY_PACE_VRR: the earliest time (performance counter) of this port's next paced flip; 0 until
+	// its first flip. Written and read by the present thread only, with `mutex` held for writes.
+	int64_t                             paced_next_flip = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -220,7 +225,20 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip(uint32_t micros);
+	// KYTY_PACE_VRR: a flip is due once its port's flip interval (flip rate + 1 vblank periods)
+	// has passed since the port's previous paced flip, instead of at a vblank count.
+	struct Pacing {
+		int64_t now    = 0; // performance counter
+		int64_t period = 1; // one vblank, in performance counter ticks
+	};
+	bool Flip(uint32_t micros, const Pacing* pacing = nullptr);
+	// Whether the next flip group is complete (every request Ready); `due` is then its port's
+	// earliest paced flip time (Pacing).
+	[[nodiscard]] bool ReadyFlipDue(int64_t& due);
+	// Counts completed flip requests; WaitForCompletion returns once it differs from `seen` or after
+	// `micros` (millisecond granularity).
+	[[nodiscard]] uint64_t CompletionGeneration();
+	void                   WaitForCompletion(uint64_t seen, uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 	bool IsPending(VideoOutConfig& cfg, int index);
@@ -253,6 +271,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	uint64_t             m_completions     = 0;
 };
 
 struct VideoOutDriver::Impl {
@@ -282,9 +301,11 @@ public:
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
 	bool                     IsHdrSupported() const noexcept { return m_presenter.IsHdrSupported(); }
 
-	void VblankBegin();
-	void VblankEnd();
+	// `advance`: vblanks this one stands for (a host stall the pace maintainer coalesced).
+	void VblankBegin(uint64_t advance = 1);
+	void VblankEnd(uint64_t advance = 1);
 	void PresentThread(std::stop_token token);
+	void PacedPresentThread(const std::stop_token& token);
 
 private:
 	Common::Mutex            m_mutex;
@@ -497,6 +518,25 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
 
+// KYTY_PACE_VRR: the port's earliest paced flip time has come (FlipQueue::Pacing).
+static bool IsPacedFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int64_t now) {
+	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
+		return false;
+	}
+	return cfg.paced_next_flip == 0 || now >= cfg.paced_next_flip;
+}
+
+// After a paced flip at `pacing.now`: the next one is due one flip interval after the previous due
+// time, but at least half an interval after this flip. Each flip moves the due time on by at least
+// an interval, so on average the port never flips faster than its flip rate allows, while a frame
+// that came late does not delay the next one by a whole interval.
+static void AdvancePacedFlipLocked(VideoOutConfig& cfg, const FlipQueue::Pacing& pacing) {
+	const int64_t interval = static_cast<int64_t>(cfg.flip_rate + 1) * pacing.period;
+	cfg.paced_next_flip    = cfg.paced_next_flip == 0
+	                             ? pacing.now + interval
+	                             : std::max(cfg.paced_next_flip + interval, pacing.now + interval / 2);
+}
+
 static bool IsValidBufferIndex(int index) {
 	return index >= VIDEO_OUT_BUFFER_INDEX_BLACK && index < VIDEO_OUT_BUFFER_NUM_MAX;
 }
@@ -668,9 +708,10 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 		EXIT_IF(group.occupied);
 	}
 
-	config.closing = false;
-	config.opened  = true;
-	config.bus     = bus_type;
+	config.closing         = false;
+	config.opened          = true;
+	config.bus             = bus_type;
+	config.paced_next_flip = 0;
 	if (++config.generation == 0) {
 		EXIT("video-out port generation wrapped\n");
 	}
@@ -803,14 +844,14 @@ int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
 	return OK;
 }
 
-void VideoOutDriver::Impl::VblankBegin() {
+void VideoOutDriver::Impl::VblankBegin(uint64_t advance) {
 	Common::LockGuard lock(m_mutex);
 
 	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
 		auto& ctx = m_video_out_ctx[i];
 		if (ctx.opened) {
 			ctx.mutex.Lock();
-			ctx.pre_vblank_status.count++;
+			ctx.pre_vblank_status.count += advance;
 			ctx.pre_vblank_status.processTime        = LibKernel::KernelGetProcessTime();
 			ctx.pre_vblank_status.reserved           = LibKernel::KernelReadTsc();
 			ctx.pre_vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
@@ -822,14 +863,14 @@ void VideoOutDriver::Impl::VblankBegin() {
 	}
 }
 
-void VideoOutDriver::Impl::VblankEnd() {
+void VideoOutDriver::Impl::VblankEnd(uint64_t advance) {
 	Common::LockGuard lock(m_mutex);
 
 	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
 		auto& ctx = m_video_out_ctx[i];
 		if (ctx.opened) {
 			ctx.mutex.Lock();
-			ctx.vblank_status.count++;
+			ctx.vblank_status.count += advance;
 			ctx.vblank_status.processTime        = LibKernel::KernelGetProcessTime();
 			ctx.vblank_status.reserved           = LibKernel::KernelReadTsc();
 			ctx.vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
@@ -842,10 +883,216 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+// KYTY_PACE (default on; =0: the fixed loop of PresentThread): the pace maintainer, for every game.
+// - Guest vblanks follow absolute deadlines from one origin, each waited for with the
+//   high-resolution timer, so timer overshoot and presentation time never add up to a slower
+//   guest clock. A vblank a host stall delayed is still delivered (its count and event, so time
+//   measured in vblanks keeps up with real time), at most 8 in a row; beyond that the count jumps
+//   with one event instead of an event storm.
+// - KYTY_PACE_VRR (default on): a completed flip is presented as soon as its port's flip interval
+//   since the previous flip has passed, instead of at the next vblank tick. On the console a frame
+//   that misses a vblank waits for the next one; a game whose frame takes slightly longer than its
+//   interval here then runs at half its frame rate, and a game that steps its simulation once per
+//   frame at half its speed (the slow motion). The interval stays a minimum on average
+//   (AdvancePacedFlipLocked), so no game runs faster than its flip rate allows. On a variable
+//   refresh display (G-SYNC, FreeSync; Mailbox or Immediate presentation) each frame is shown as it
+//   is done.
+static bool EnvSwitchOn(const char* name) {
+	const char* value = std::getenv(name);
+	return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+}
+
+static bool PaceEnabled() {
+	static const bool enabled = EnvSwitchOn("KYTY_PACE");
+	return enabled;
+}
+
+static bool PaceVrrEnabled() {
+	static const bool enabled = EnvSwitchOn("KYTY_PACE_VRR");
+	return enabled;
+}
+
+void VideoOutDriver::Impl::PacedPresentThread(const std::stop_token& token) {
+	const auto frequency = static_cast<int64_t>(Common::Timer::QueryPerformanceFrequency());
+	EXIT_IF(frequency <= 0);
+	const auto now_qpc = [] { return static_cast<int64_t>(Common::Timer::QueryPerformanceCounter()); };
+	const auto to_us   = [frequency](int64_t ticks) {
+		return static_cast<uint32_t>(
+		    std::clamp<int64_t>((ticks * 1'000'000 + frequency - 1) / frequency, 1, 1'000'000));
+	};
+	const bool    vrr        = PaceVrrEnabled();
+	const int64_t coarse_min = frequency * 25 / 10'000; // 2.5 ms: below this the precise timer waits
+	const int64_t coarse_end = frequency * 15 / 10'000; // the condition wait ends 1.5 ms early
+	uint32_t      refresh    = 0;
+	int64_t       period     = 1;
+	int64_t       origin     = 0;
+	uint64_t      ticks      = 0;
+	uint32_t      placement_count = 0;
+	bool          was_paused      = false;
+	// KYTY_PACE_LOG=1: a "Pace 10s" line with the flip rate, how many flips went out between
+	// vblanks (VRR pacing) and at ticks, the longest gap between flips and the late vblanks.
+	struct PaceStats {
+		uint64_t early = 0, at_tick = 0, late_vblanks = 0, coalesced = 0;
+		int64_t  last_flip = 0, longest = 0, begin = 0;
+	};
+	const char* log_value = std::getenv("KYTY_PACE_LOG");
+	const bool  log_pace  = log_value != nullptr && *log_value != '\0' && std::strcmp(log_value, "0") != 0;
+	PaceStats  stats;
+	stats.begin          = now_qpc();
+	const auto note_flip = [&](int64_t at, bool early) {
+		(early ? stats.early : stats.at_tick)++;
+		if (stats.last_flip != 0) {
+			stats.longest = std::max(stats.longest, at - stats.last_flip);
+		}
+		stats.last_flip = at;
+	};
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Pace maintainer: guest vblank on absolute {} Hz deadlines{} (KYTY_PACE=0: the fixed loop)\n",
+	    std::max(Config::GetVblankFrequency(), 1u),
+	    vrr ? "; flips presented as soon as their flip interval allows (KYTY_PACE_VRR=0: at vblank ticks)" : ""));
+	while (!token.stop_requested()) {
+		if ((++placement_count & 7u) == 0u) {
+			Common::SamplePlacement(Common::ThreadRole::Host);
+		}
+		const auto wanted = std::max(Config::GetVblankFrequency(), 1u);
+		if (wanted != refresh) {
+			refresh = wanted;
+			period  = std::max<int64_t>(frequency / refresh, 1);
+			origin  = now_qpc();
+			ticks   = 0;
+		}
+		if (m_presenter.IsGuestPaused()) {
+			(void)m_presenter.PresentLastFrame();
+			Common::Thread::SleepMicro(to_us(period));
+			was_paused = true;
+			continue;
+		}
+		if (was_paused) {
+			// No catch-up for the paused time.
+			was_paused = false;
+			origin     = now_qpc() - static_cast<int64_t>(ticks) * period;
+		}
+		const int64_t deadline  = origin + static_cast<int64_t>(ticks + 1) * period;
+		bool          presented = false;
+		// A ready group Flip declined (its port is closing): retried at the tick, not in a spin.
+		bool blocked = false;
+		for (;;) {
+			const auto seen = m_flip_queue.CompletionGeneration();
+			const auto now  = now_qpc();
+			if (now >= deadline || token.stop_requested()) {
+				break;
+			}
+			int64_t    wake  = deadline;
+			int64_t    due   = 0;
+			const bool ready = vrr && !blocked && m_flip_queue.ReadyFlipDue(due);
+			if (ready && now >= due) {
+				const FlipQueue::Pacing pacing {now, period};
+				if (m_flip_queue.Flip(0, &pacing)) {
+					presented = true;
+					note_flip(now, true);
+				} else {
+					blocked = true;
+				}
+				continue;
+			}
+			if (ready) {
+				wake = std::min(wake, due);
+			}
+			const auto remaining = wake - now;
+			if (vrr && remaining > coarse_min) {
+				m_flip_queue.WaitForCompletion(seen, to_us(remaining - coarse_end));
+			} else {
+				Common::Thread::SleepMicro(to_us(remaining));
+			}
+		}
+		if (token.stop_requested()) {
+			break;
+		}
+		// The vblank (and those a host stall delayed: up to 8 delivered, the rest coalesced).
+		const auto     now   = now_qpc();
+		const uint64_t late  = static_cast<uint64_t>(std::max<int64_t>((now - deadline) / period, 0));
+		const uint64_t burst = std::min<uint64_t>(late, 7);
+		for (uint64_t i = 0; i < burst; i++) {
+			VblankBegin();
+			VblankEnd();
+		}
+		const uint64_t advance = 1 + (late - burst);
+		ticks += late + 1;
+		stats.late_vblanks += late;
+		stats.coalesced += late - burst;
+		VblankBegin(advance);
+		if (vrr) {
+			// Only a due group: Flip would otherwise wait up to a millisecond for a submission.
+			int64_t due = 0;
+			if (m_flip_queue.ReadyFlipDue(due) && now >= due) {
+				const FlipQueue::Pacing pacing {now, period};
+				if (m_flip_queue.Flip(0, &pacing)) {
+					presented = true;
+					note_flip(now, false);
+				}
+			}
+		} else if (m_flip_queue.Flip(0)) {
+			presented = true;
+			note_flip(now, false);
+		}
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+			if (m_presenter.PresentLastFrame()) {
+				presented = true;
+			} else {
+				uint32_t width  = 0;
+				uint32_t height = 0;
+				{
+					Common::LockGuard lock(m_mutex);
+					width  = m_video_out_ctx[0].width;
+					height = m_video_out_ctx[0].height;
+				}
+				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
+				m_presenter.Present(blank);
+				presented = true;
+			}
+		}
+		if (!presented) {
+			bool     any_open = false;
+			uint32_t width    = 0;
+			uint32_t height   = 0;
+			{
+				Common::LockGuard lock(m_mutex);
+				width  = m_video_out_ctx[0].width;
+				height = m_video_out_ctx[0].height;
+				for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+					any_open |= m_video_out_ctx[handle].opened;
+				}
+			}
+			if (!any_open) {
+				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
+				m_presenter.Present(blank);
+			}
+		}
+		VblankEnd(advance);
+		if (log_pace && now - stats.begin >= frequency * 10) {
+			const double seconds = static_cast<double>(now - stats.begin) / static_cast<double>(frequency);
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Pace 10s: {:.1f} flips/s ({} between vblanks, {} at vblank ticks), longest gap {:.1f} ms; {} "
+			    "late vblanks ({} coalesced)\n",
+			    static_cast<double>(stats.early + stats.at_tick) / seconds, stats.early, stats.at_tick,
+			    static_cast<double>(stats.longest) * 1000.0 / static_cast<double>(frequency), stats.late_vblanks,
+			    stats.coalesced));
+			const auto last = stats.last_flip;
+			stats           = {};
+			stats.begin     = now;
+			stats.last_flip = last;
+		}
+	}
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
 	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
 	Common::RaiseServiceThreadPriority();
+	if (PaceEnabled()) {
+		PacedPresentThread(token);
+		return;
+	}
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
@@ -1157,6 +1404,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		m_completions++;
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1209,7 +1457,7 @@ bool FlipQueue::IsPending(VideoOutConfig& cfg, int index) {
 	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::Flip(uint32_t micros, const Pacing* pacing) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1254,7 +1502,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->mutex.Lock();
 		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
 		if (r.id == group) {
-			due &= IsFlipDueLocked(*r.cfg, r.generation);
+			due &= pacing != nullptr ? IsPacedFlipDueLocked(*r.cfg, r.generation, pacing->now)
+			                         : IsFlipDueLocked(*r.cfg, r.generation);
 		}
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}
@@ -1273,6 +1522,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 			continue;
 		}
 		auto& r = *it;
+		if (pacing != nullptr && r.id == group) {
+			AdvancePacedFlipLocked(*r.cfg, *pacing);
+		}
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1319,6 +1571,41 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 	}
 	return due;
+}
+
+bool FlipQueue::ReadyFlipDue(int64_t& due) {
+	Common::LockGuard lock(m_mutex);
+	if (m_processing) {
+		return false;
+	}
+	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
+	                               [](const auto& r) { return r.group == r.id; });
+	if (owner == m_requests.end()) {
+		return false;
+	}
+	const uint64_t group = owner->id;
+	if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+	                [group](const auto& r) { return r.group == group; }) ||
+	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
+		    return r.group == group && r.state != RequestState::Ready;
+	    })) {
+		return false;
+	}
+	// Written by this (the present) thread only.
+	due = owner->cfg->paced_next_flip;
+	return true;
+}
+
+uint64_t FlipQueue::CompletionGeneration() {
+	Common::LockGuard lock(m_mutex);
+	return m_completions;
+}
+
+void FlipQueue::WaitForCompletion(uint64_t seen, uint32_t micros) {
+	Common::LockGuard lock(m_mutex);
+	if (m_completions == seen) {
+		m_submit_cond_var.WaitFor(&m_mutex, micros);
+	}
 }
 
 void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {

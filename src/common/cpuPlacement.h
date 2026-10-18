@@ -67,6 +67,10 @@
 //   inside the V-cache CCD. Cold threads (PlaceCurrentThreadCold: shader and pipeline compile
 //   workers, pipeline journal/cache savers, file I/O, audio3d playback, diagnostics and monitors)
 //   get the other CCD through their thread-selected CPU sets.
+// - KYTY_HYBRID_PLACEMENT=auto|0 (default auto): on Intel hybrid processors (P- and E-cores, by
+//   the CPU sets' EfficiencyClass) the cold threads get the E-cores through their thread-selected
+//   CPU sets instead, and the CP's reserved core is a P-core. Hot threads are not restricted:
+//   Windows keeps placing the game's threads by its own (Thread Director) rules.
 // - One "Kyty V-cache placement" line logs the decision at startup and whenever it changes.
 //
 // Placement samples, with the profiler's aggregates, the hang trace or
@@ -92,6 +96,8 @@ struct CpuSetInfo {
 	uint8_t  cache            = 0; // LastLevelCacheIndex
 	uint8_t  scheduling_class = 0; // higher = preferred (CPPC)
 	bool     allowed          = false;
+	// Higher = faster core (Intel hybrid: P-cores above E-cores; 0 everywhere on other CPUs).
+	uint8_t  efficiency_class = 0;
 };
 
 struct CpuLayout {
@@ -110,6 +116,10 @@ struct CpuLayout {
 	bool                  vcache    = false;
 	std::vector<uint32_t> cold_ids;
 	uint64_t              cold_mask = 0;
+	// KYTY_HYBRID_PLACEMENT (default auto): on a CPU with faster and slower cores (Intel P- and
+	// E-cores) the cold threads get the slower cores (cold_ids), keeping the faster ones for the
+	// game, the CP and the renderer's hot threads; hot threads are not restricted.
+	bool                  hybrid    = false;
 };
 
 // One L3 cache group: the logical processors sharing it (group-relative mask) and its size.

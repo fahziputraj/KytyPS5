@@ -14,6 +14,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/sehGuard.h"
+#include "common/shaderPreloadStatus.h"
 #include "common/skipInvalid.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -34,6 +35,7 @@
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/rtSession.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPreload.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderCodeSnapshot.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -250,6 +252,35 @@ uint64_t EnvU64(const char* name, uint64_t default_value) {
 	return end != value ? parsed : default_value;
 }
 
+// KYTY_SHADER_PRELOAD (default on; =0 off): the start-up replays of what earlier runs compiled
+// (KYTY_SHADER_PRECOMPILE, KYTY_PIPELINE_JOURNAL, KYTY_PIPELINE_PREWARM_COMPUTE, the software RT
+// kernels) run on most of the CPU at normal priority, and the game starts only once they are done
+// (WaitForShaderPreload: the guest's first thread waits, the window shows their progress), as a
+// native PC game prepares its shaders before its menu. The graphics pipelines the replay builds are
+// kept (KYTY_PIPELINE_RESIDENT_MAX, default 4096; 0 builds them into the driver cache only), and
+// the draw that first needs one takes it without any driver call. A first run has nothing
+// journaled and starts at once. KYTY_SHADER_PRELOAD_THREADS (default: logical processors - 2,
+// 1..16) sets the replay threads; KYTY_SHADER_PRELOAD_MAX_S (default 0: no limit) starts the game
+// after that many seconds anyway; Esc, Enter or a pad's Options/Cross button skips the rest of the
+// wait. Whatever is left then finishes in the background while the game runs.
+bool ShaderPreloadEnabled() {
+	static const bool enabled =
+	    EnvU64("KYTY_SHADER_PRELOAD", 1) != 0 && EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) == 0;
+	return enabled;
+}
+
+uint32_t ShaderPreloadThreads() {
+	static const uint32_t threads = [] {
+		const auto logical = std::max(2u, std::thread::hardware_concurrency());
+		return static_cast<uint32_t>(
+		    std::clamp<uint64_t>(EnvU64("KYTY_SHADER_PRELOAD_THREADS", logical > 4 ? logical - 2 : 2), 1, 16));
+	}();
+	return threads;
+}
+
+// The cache whose start-up replays the guest waits for (WaitForShaderPreload); set once.
+std::atomic<PipelineCache*> g_preload_cache {nullptr};
+
 // When the background saver writes the driver cache (KYTY_PIPELINE_CACHE_SAVE=0 disables it and
 // leaves only the save at exit). A save needs at least MIN_NEW (32) pipelines created since the
 // last one and no new pipeline for SETTLE (2 s), so it does not compete with a compile burst; then
@@ -332,6 +363,8 @@ struct CompileTotals {
 	std::atomic<uint64_t> known_misses {0};
 	std::atomic<uint64_t> prewarm_built {0}, prewarm_ns {0};
 	std::atomic<uint64_t> journal_built {0}, journal_skipped {0}, journal_ns {0}, journal_unpredicted {0};
+	// Shader preload (KYTY_SHADER_PRELOAD): replayed pipelines kept, and taken by a draw.
+	std::atomic<uint64_t> resident_kept {0}, resident_adopted {0};
 	std::atomic<uint64_t> window_stall_max_ns {0}; // reset by each stats line
 };
 CompileTotals g_compile_totals;
@@ -4531,14 +4564,21 @@ struct PipelineCache::RtState {
 		return static_cast<uint32_t>(std::min<uint64_t>(EnvU64("KYTY_RT_PIPELINE_WAIT_MS", 250), 600000));
 	}
 
+	// KYTY_RT_PIPELINE_THREADS (1..4; default 2, or 4 while the shader preload makes the game wait
+	// for these builds: then they also run on any processor, not only the cold ones).
+	static size_t Threads(bool preloading) {
+		return static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", preloading ? 4 : 2), 1, 4));
+	}
+
 	explicit RtState(PipelineCache& owner)
 	    : cache(owner), wait_ms(WaitBudgetMs()),
-	      queue(static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 2), 1, 4)), 64,
-	            Common::PlaceCurrentThreadCold) {
+	      queue(Threads(owner.m_preloading.load(std::memory_order_acquire)), 64,
+	            owner.m_preloading.load(std::memory_order_acquire) ? std::function<void()> {}
+	                                                                : std::function<void()> {Common::PlaceCurrentThreadCold}) {
 		PipelineCacheLog("Software RT pipelines: built on {} background thread(s); a dispatch waits at most {} "
 		                 "for its kernel's pipeline, then is skipped until it is ready "
 		                 "(KYTY_RT_PIPELINE_WAIT_MS; KYTY_RT_PIPELINE_ASYNC=0 waits for it)",
-		                 std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 2), 1, 4),
+		                 Threads(owner.m_preloading.load(std::memory_order_acquire)),
 		                 wait_ms == UINT32_MAX ? std::string("for ever") : std::to_string(wait_ms) + " ms");
 	}
 
@@ -4664,6 +4704,21 @@ struct PipelineCache::RtState {
 		return slot->second.get();
 	}
 
+	// Builds requested and not finished yet (the shader preload's progress). A finished build is
+	// published only when a dispatch takes it, so the totals cannot tell.
+	[[nodiscard]] uint64_t PendingBuilds() {
+		std::scoped_lock lock(mutex);
+		uint64_t         pending = 0;
+		for (const auto& [id, job]: jobs) {
+			(void)id;
+			if (!job.consumed && job.future.valid() &&
+			    job.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+				pending++;
+			}
+		}
+		return pending;
+	}
+
 	// Returns once every requested build has finished (KYTY_PIPELINE_LIST_PREPARE).
 	void WaitAll() {
 		std::vector<std::shared_future<std::shared_ptr<Built>>> futures;
@@ -4769,8 +4824,11 @@ bool DecodeJournalPayload(std::span<const uint8_t> bytes, JournalPayload& out) {
 // path (RtState). A dispatch that comes first builds its pipeline as usual and the prewarmed one is
 // dropped: wasted work, never a wait. KYTY_PIPELINE_PREWARM_THREADS (default 1, 4 when preparing, 1..8).
 struct PipelineCache::ComputePrewarm {
-	ComputePrewarm(PipelineCache& owner, size_t threads)
-	    : cache(owner), queue(threads, SIZE_MAX, Common::PlaceCurrentThreadCold) {}
+	// `preload` (KYTY_SHADER_PRELOAD): the game waits for these builds, so they run at normal
+	// priority on any processor.
+	ComputePrewarm(PipelineCache& owner, size_t threads, bool preload)
+	    : cache(owner), full_speed(preload),
+	      queue(threads, SIZE_MAX, preload ? std::function<void()> {} : std::function<void()> {Common::PlaceCurrentThreadCold}) {}
 	~ComputePrewarm() { Stop(); }
 	ComputePrewarm(const ComputePrewarm&)            = delete;
 	ComputePrewarm& operator=(const ComputePrewarm&) = delete;
@@ -4808,11 +4866,19 @@ struct PipelineCache::ComputePrewarm {
 		}
 	}
 
+	// Requested builds not finished yet (the shader preload's progress).
+	[[nodiscard]] uint64_t Pending() const {
+		const auto finished = built.load(std::memory_order_relaxed) + dropped.load(std::memory_order_relaxed) +
+		                      failed.load(std::memory_order_relaxed);
+		const auto all = requested.load(std::memory_order_relaxed);
+		return all > finished ? all - finished : 0;
+	}
+
 	void Build(uint64_t id, const ShaderComputeInputInfo& info, vk::ShaderModule module) {
 		static thread_local bool named = false;
 		if (!named) {
 			named = true;
-			LowerCurrentThreadPriority();
+			if (!full_speed) LowerCurrentThreadPriority();
 			Profiler::SetThreadName("ComputePrewarm");
 		}
 		{
@@ -4851,12 +4917,76 @@ struct PipelineCache::ComputePrewarm {
 		GpuOpProfiler::RegisterComputePipeline(pipeline->pipeline, id);
 		cache.m_compute_pipelines.emplace(id, std::move(pipeline));
 		g_compile_totals.prewarm_built.fetch_add(1, std::memory_order_relaxed);
+		built.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	PipelineCache&        cache;
+	const bool            full_speed;
 	std::atomic<bool>     stopped {false};
-	std::atomic<uint64_t> requested {0}, dropped {0}, failed {0};
+	std::atomic<uint64_t> requested {0}, dropped {0}, failed {0}, built {0};
 	PipelineCompileQueue  queue; // last: joined before the rest goes
+};
+
+// Graphics pipelines the shader preload's journal replay built and keeps (KYTY_SHADER_PRELOAD,
+// KYTY_PIPELINE_RESIDENT_MAX), by content key, each with the interned layout reference it was
+// built with. The draw that needs one takes the handle (its map entry owns it then, with the
+// draw's own layout reference: identically defined layouts are one interned object, and the key
+// covers the layout signature), so it creates nothing. The rest are destroyed at exit, before the
+// interned layouts.
+struct PipelineCache::ResidentPipelines {
+	struct Entry {
+		vk::Pipeline            pipeline   = nullptr;
+		vk::PipelineLayout      layout     = nullptr;
+		vk::DescriptorSetLayout set_layout = nullptr;
+	};
+
+	explicit ResidentPipelines(size_t max_count): max(max_count) {}
+
+	// False (the caller keeps the pipeline) when full or when the key is kept already.
+	bool Keep(uint64_t key, vk::Pipeline pipeline, vk::PipelineLayout layout, vk::DescriptorSetLayout set_layout) {
+		std::scoped_lock lock(mutex);
+		if (key == 0 || pipeline == nullptr || entries.size() >= max) return false;
+		if (!entries.emplace(key, Entry {pipeline, layout, set_layout}).second) return false;
+		count.store(entries.size(), std::memory_order_release);
+		g_compile_totals.resident_kept.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+
+	// The pipeline kept for `key`, now the caller's, or null.
+	vk::Pipeline Take(GraphicContext& graphics, uint64_t key) {
+		if (key == 0 || count.load(std::memory_order_acquire) == 0) return nullptr;
+		Entry entry;
+		{
+			std::scoped_lock lock(mutex);
+			const auto found = entries.find(key);
+			if (found == entries.end()) return nullptr;
+			entry = found->second;
+			entries.erase(found);
+			count.store(entries.size(), std::memory_order_release);
+		}
+		ReleasePipelineLayout(graphics, entry.layout, entry.set_layout);
+		g_compile_totals.resident_adopted.fetch_add(1, std::memory_order_relaxed);
+		return entry.pipeline;
+	}
+
+	void DestroyAll(GraphicContext& graphics) {
+		std::scoped_lock lock(mutex);
+		for (const auto& [key, entry]: entries) {
+			(void)key;
+			graphics.device.destroyPipeline(entry.pipeline, nullptr);
+			ReleasePipelineLayout(graphics, entry.layout, entry.set_layout);
+		}
+		entries.clear();
+		count.store(0, std::memory_order_release);
+	}
+
+	[[nodiscard]] size_t Count() const { return count.load(std::memory_order_acquire); }
+	[[nodiscard]] bool   HasRoom() const { return Count() < max; }
+
+	std::mutex                          mutex;
+	std::unordered_map<uint64_t, Entry> entries;
+	const size_t                        max;
+	std::atomic<size_t>                 count {0};
 };
 
 // KYTY_PIPELINE_LIST (default off): a KYPLST1 pipeline list (pipelineList.h) made from recorded runs,
@@ -4922,8 +5052,21 @@ struct PipelineCache::JournalReplay {
 	void Start(uint32_t thread_count, bool force_known) {
 		force    = force_known;
 		begin_ns = CompileClockNs();
+		expected.store(items.size(), std::memory_order_release);
 		running  = std::max<uint32_t>(1, thread_count);
 		for (uint32_t i = 0; i < running; i++) threads.emplace_back([this] { Worker(); });
+	}
+
+	// The shader preload's progress: records replayed, records in all (the item count until the
+	// order is built), and whether a worker still runs.
+	struct Progress {
+		uint64_t done = 0, total = 0;
+		bool     running = false;
+	};
+	[[nodiscard]] Progress GetProgress() const {
+		const auto ordered = total.load(std::memory_order_acquire);
+		return {done.load(std::memory_order_relaxed), ordered != 0 ? ordered : expected.load(std::memory_order_acquire),
+		        running.load(std::memory_order_acquire) != 0};
 	}
 
 	// The boot level's records first, then the rest by rank (stable: first-needed order within one).
@@ -4999,7 +5142,7 @@ struct PipelineCache::JournalReplay {
 	void Worker() {
 		if (low_priority) LowerCurrentThreadPriority();
 		Profiler::SetThreadName("PipelineJournal");
-		Common::PlaceCurrentThreadCold();
+		if (!preload) Common::PlaceCurrentThreadCold();
 		// The pipelines need the programs' modules: wait for the shader precompile replay.
 		if (cache.m_shader_precompiler != nullptr) cache.m_shader_precompiler->Wait();
 		std::call_once(order_once, [this] {
@@ -5065,7 +5208,10 @@ struct PipelineCache::JournalReplay {
 			failed.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
-		if (!force && !item.from_list && cache.IsKnownPipeline(record.key)) {
+		// A resident replay builds known keys too: from the driver cache that is quick, and the draw
+		// then needs no driver call at all.
+		const bool keep = resident && cache.m_resident != nullptr && cache.m_resident->HasRoom();
+		if (!force && !keep && !item.from_list && cache.IsKnownPipeline(record.key)) {
 			skipped_known.fetch_add(1, std::memory_order_relaxed);
 			g_compile_totals.journal_skipped.fetch_add(1, std::memory_order_relaxed);
 			NoteReplayKey(record.key);
@@ -5127,13 +5273,14 @@ struct PipelineCache::JournalReplay {
 			    return vk::ShaderModule {};
 		    },
 		    layouts.pipeline_layout);
-		vk::Pipeline pipeline = nullptr;
-		bool         ok       = false;
+		vk::Pipeline pipeline  = nullptr;
+		bool         ok        = false;
+		uint64_t     built_key = 0;
 		if (snapshot != nullptr) {
 			// The rebuilt create info must describe the journaled pipeline exactly.
 			const auto check = DescribeGraphicsPipeline(snapshot->Info(), signature.subspan(0));
 			if (check.key != 0) NoteReplayKey(check.key);
-			if (retargeted && check.key != 0 && !force && cache.IsKnownPipeline(check.key)) {
+			if (retargeted && check.key != 0 && !force && !keep && cache.IsKnownPipeline(check.key)) {
 				skipped_known.fetch_add(1, std::memory_order_relaxed);
 				g_compile_totals.journal_skipped.fetch_add(1, std::memory_order_relaxed);
 				ok = true;
@@ -5155,15 +5302,23 @@ struct PipelineCache::JournalReplay {
 					g_compile_totals.journal_built.fetch_add(1, std::memory_order_relaxed);
 					built.fetch_add(1, std::memory_order_relaxed);
 					if (item.from_list) built_list.fetch_add(1, std::memory_order_relaxed);
+					const bool was_known = cache.IsKnownPipeline(check.key);
 					cache.NoteKnownPipeline(check.key);
-					cache.NotePipelineCreated(ns);
+					// A known key came from the driver cache: nothing new to save.
+					if (!was_known) cache.NotePipelineCreated(ns);
+					built_key = check.key;
 				}
 			} else {
 				mismatched.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
-		if (pipeline != nullptr) device.destroyPipeline(pipeline, nullptr);
-		ReleasePipelineLayout(cache.m_graphics, layouts.pipeline_layout, layouts.set_layout);
+		// The shader preload keeps what it built for the draw that needs it.
+		const bool kept = pipeline != nullptr && built_key != 0 && keep &&
+		                  cache.m_resident->Keep(built_key, pipeline, layouts.pipeline_layout, layouts.set_layout);
+		if (!kept) {
+			if (pipeline != nullptr) device.destroyPipeline(pipeline, nullptr);
+			ReleasePipelineLayout(cache.m_graphics, layouts.pipeline_layout, layouts.set_layout);
+		}
 		unpin();
 		if (!ok) failed.fetch_add(1, std::memory_order_relaxed);
 	}
@@ -5211,6 +5366,10 @@ struct PipelineCache::JournalReplay {
 	const bool                   strict;
 	bool                         force        = false;
 	bool                         low_priority = true;
+	// KYTY_SHADER_PRELOAD: the game waits for the replay (no cold placement), and with `resident` the
+	// built pipelines are kept for the draws (ResidentPipelines) and known keys are built too.
+	bool                         preload      = false;
+	bool                         resident     = false;
 	// Coverage bookkeeping (KYTY_PIPELINE_LIST or _VERIFY): every key the replay computed and every key
 	// the game created.
 	bool                         track        = false;
@@ -5221,7 +5380,7 @@ struct PipelineCache::JournalReplay {
 	std::vector<Item>            items;       // filled before Start
 	std::vector<std::string>     list_level_names;
 	std::vector<uint32_t>        order;
-	std::atomic<uint64_t>        next {0}, done {0}, total {0}, last_report_ns {0}, full_checks {0};
+	std::atomic<uint64_t>        next {0}, done {0}, total {0}, last_report_ns {0}, full_checks {0}, expected {0};
 	std::atomic<uint32_t>        running {0};
 	std::atomic<bool>            stop {false}, logged_exit {false}, stopped_once {false}, cache_full {false};
 	std::atomic<uint64_t> built {0}, built_list {0}, skipped_known {0}, missing {0}, failed {0}, mismatched {0},
@@ -5370,17 +5529,35 @@ void PipelineCache::InitializePipelineJournal() {
 	// anyway (tests).
 	const bool force   = EnvU64("KYTY_PIPELINE_JOURNAL_FORCE", 0) != 0;
 	const bool prepare = m_list != nullptr && m_list->prepare;
+	const bool preload = ShaderPreloadEnabled() && !prepare;
+	// Kept pipelines help without a driver cache too (they are the draws' pipelines themselves).
+	const auto resident_max = preload ? std::min<uint64_t>(EnvU64("KYTY_PIPELINE_RESIDENT_MAX", 4096), 1u << 16) : 0;
 	if (EnvU64("KYTY_PIPELINE_JOURNAL_REPLAY", 1) == 0 || replay.items.empty() ||
-	    (m_driver_cache == nullptr && !force)) {
+	    (m_driver_cache == nullptr && !force && resident_max == 0)) {
 		replay.items = {};
 		return;
 	}
-	replay.low_priority = !prepare;
-	replay.report_ns    = prepare ? 5'000'000'000ull : 10'000'000'000ull;
+	replay.low_priority = !prepare && !preload;
+	replay.preload      = preload;
+	replay.report_ns    = prepare || preload ? 5'000'000'000ull : 10'000'000'000ull;
+	if (resident_max != 0) {
+		m_resident      = std::make_unique<ResidentPipelines>(static_cast<size_t>(resident_max));
+		replay.resident = true;
+	}
 	// With a pipeline list (a first start builds hundreds at once) 8: a cold spring_punch_sky_aztec
 	// stalled 5.5 s on 8 threads, 10.3 s on 4 (the level needs ~290 pipelines in its first 20 s).
-	const auto threads  = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", prepare || list ? 8 : 4), 1, 16);
+	const auto threads = std::clamp<uint64_t>(
+	    EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", preload ? ShaderPreloadThreads() : prepare || list ? 8 : 4), 1, 16);
 	replay.Start(static_cast<uint32_t>(threads), force);
+	if (preload) {
+		m_preloading.store(true, std::memory_order_release);
+		m_preload_pending = true;
+		PipelineCacheLog("Shader preload: {} journaled graphics pipelines are rebuilt on {} threads before the game "
+		                 "starts{}",
+		                 replay.items.size(), threads,
+		                 resident_max != 0 ? fmt::format(" and kept for the draws (up to {})", resident_max)
+		                                   : std::string());
+	}
 	if (EnvU64("KYTY_PIPELINE_JOURNAL_WAIT", 0) != 0) replay.Wait();
 }
 
@@ -5702,9 +5879,96 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	}
 	if (EnvU64("KYTY_PIPELINE_STATS", 0) != 0) m_stats_reporter = std::make_unique<StatsReporter>(*this);
 	if (EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0 && !PipelineCacheTitleId().empty()) RunListPrepare();
+	if (m_preload_pending) g_preload_cache.store(this, std::memory_order_release);
+}
+
+// The shader preload's wait (KYTY_SHADER_PRELOAD), on the guest's first thread before the game
+// runs: polls the start-up replays in the order they depend on each other (programs, then the
+// compute and RT pipelines the program replay requested, then the graphics pipelines, whose
+// workers wait for the program replay) and publishes their progress for the overlay.
+void PipelineCache::WaitShaderPreload() {
+	if (!m_preload_pending.exchange(false)) return;
+	namespace Preload = Common::ShaderPreload;
+	const auto begin     = CompileClockNs();
+	const auto max_ns    = EnvU64("KYTY_SHADER_PRELOAD_MAX_S", 0) * 1'000'000'000ull;
+	const auto replayed0 = g_compile_totals.replayed.load(std::memory_order_relaxed);
+	Preload::Begin(begin);
+	PipelineCacheLog("Shader preload: the game starts once the shaders and pipelines of earlier runs are prepared "
+	                 "(Esc, Enter or a pad's Options/Cross button skips the rest)");
+	const char* ended   = "done";
+	auto        last_ns = begin;
+	for (;;) {
+		const auto now = CompileClockNs();
+		if (Preload::SkipRequested()) {
+			ended = "skipped";
+			break;
+		}
+		if (max_ns != 0 && now - begin >= max_ns) {
+			ended = "stopped at KYTY_SHADER_PRELOAD_MAX_S";
+			break;
+		}
+		ShaderPrecompiler::Progress shaders;
+		if (m_shader_precompiler != nullptr) shaders = m_shader_precompiler->GetProgress();
+		const bool     shaders_done = m_shader_precompiler == nullptr || shaders.finished;
+		const uint64_t compute_left = shaders_done && m_compute_prewarm != nullptr ? m_compute_prewarm->Pending() : 0;
+		const uint64_t compute_all  = m_compute_prewarm != nullptr ? m_compute_prewarm->requested.load() : 0;
+		// RT kernels the program replay requested (PrewarmComputePipeline): their builds, not their
+		// publication, which waits for the game's first dispatch.
+		RtPipelineTotals rt;
+		uint64_t         rt_left = 0;
+		if (shaders_done && m_rt_ready.load(std::memory_order_acquire)) {
+			rt      = m_rt->Totals();
+			rt_left = RtSession::Failed() ? 0 : m_rt->PendingBuilds();
+		}
+		JournalReplay::Progress pipelines;
+		if (m_journal_replay != nullptr) pipelines = m_journal_replay->GetProgress();
+		const uint64_t all_total = shaders.total + compute_all + rt.requested + pipelines.total;
+		const uint64_t all_done  = shaders.done + (compute_all - std::min(compute_all, compute_left)) +
+		                          (rt.requested - std::min(rt.requested, rt_left)) + pipelines.done;
+		if (!shaders_done) {
+			Preload::Update(Preload::Phase::Shaders, shaders.done, shaders.total, all_done, all_total);
+		} else if (compute_left != 0) {
+			Preload::Update(Preload::Phase::Compute, compute_all - compute_left, compute_all, all_done, all_total);
+		} else if (rt_left != 0) {
+			Preload::Update(Preload::Phase::RayTracing, rt.requested - rt_left, rt.requested, all_done, all_total);
+		} else if (pipelines.running) {
+			Preload::Update(Preload::Phase::Pipelines, pipelines.done, pipelines.total, all_done, all_total);
+		} else {
+			break;
+		}
+		if (now - last_ns >= 5'000'000'000ull) {
+			last_ns = now;
+			PipelineCacheLog("Shader preload: {}/{} ({:.0f}%), {:.1f} s", all_done, all_total,
+			                 all_total != 0 ? 100.0 * static_cast<double>(all_done) / static_cast<double>(all_total)
+			                                : 100.0,
+			                 static_cast<double>(now - begin) / 1e9);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(33));
+	}
+	Preload::Finish();
+	m_preloading.store(false, std::memory_order_release);
+	const auto& t = g_compile_totals;
+	PipelineCacheLog("Shader preload: {} after {:.1f} s: {} shader permutations replayed, {} compute pipelines "
+	                 "prewarmed, {} RT pipelines, {} graphics pipelines rebuilt ({} kept for the draws){}",
+	                 ended, static_cast<double>(CompileClockNs() - begin) / 1e9,
+	                 t.replayed.load() - replayed0, t.prewarm_built.load(),
+	                 m_rt_ready.load(std::memory_order_acquire) ? m_rt->Totals().requested - m_rt->PendingBuilds() : 0,
+	                 t.journal_built.load(), t.resident_kept.load(),
+	                 std::strcmp(ended, "done") == 0 ? "" : "; the rest finishes in the background");
+}
+
+void WaitForShaderPreload() {
+	if (auto* cache = g_preload_cache.exchange(nullptr, std::memory_order_acq_rel); cache != nullptr) {
+		cache->WaitShaderPreload();
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	g_preload_cache.store(nullptr, std::memory_order_release);
+	if (m_resident != nullptr) {
+		PipelineCacheLog("Shader preload: {} kept graphics pipelines were taken by draws, {} never needed",
+		                 g_compile_totals.resident_adopted.load(), m_resident->Count());
+	}
 	m_stats_reporter.reset();
 	StopBackgroundPipelines();
 	StopShaderPrecompile();
@@ -5734,6 +5998,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// After the journal replay stopped (StopBackgroundPipelines, in Save), before the interned layouts.
+	if (m_resident != nullptr) m_resident->DestroyAll(m_graphics);
 	if (m_fast_first != nullptr) {
 		// Replaced unoptimized pipelines still waiting for their retirement age; the optimized
 		// builds that replaced them were destroyed with their entries above.
@@ -6182,14 +6448,16 @@ void PipelineCache::InitializeShaderPrecompile() {
 		return;
 	}
 	const bool prepare = m_list != nullptr && m_list->prepare;
+	const bool preload = ShaderPreloadEnabled() && !prepare;
 	ShaderPrecompiler::Settings replay;
-	replay.threads     = static_cast<uint32_t>(
-	    std::clamp<uint64_t>(EnvU64("KYTY_SHADER_PRECOMPILE_THREADS", prepare ? 8 : 2), 1, 16));
-	replay.low_priority = !prepare;
-	replay.max_entries = EnvU64("KYTY_SHADER_PRECOMPILE_MAX", 30000);
-	replay.thread_init = [](uint32_t) {
+	replay.threads     = static_cast<uint32_t>(std::clamp<uint64_t>(
+        EnvU64("KYTY_SHADER_PRECOMPILE_THREADS", preload ? ShaderPreloadThreads() : prepare ? 8 : 2), 1, 16));
+	replay.low_priority = !prepare && !preload;
+	// The preload replays everything the journal holds (the game waits for it once, at start-up).
+	replay.max_entries = EnvU64("KYTY_SHADER_PRECOMPILE_MAX", preload ? 0 : 30000);
+	replay.thread_init = [preload](uint32_t) {
 		Profiler::SetThreadName("ShaderPrecompile");
-		Common::PlaceCurrentThreadCold();
+		if (!preload) Common::PlaceCurrentThreadCold();
 	};
 	// The software ray-tracing kernels first (and their pipelines, started as each is published):
 	// a cold pipeline build takes seconds, and the game needs them at its first lighting pass.
@@ -6197,9 +6465,10 @@ void PipelineCache::InitializeShaderPrecompile() {
 		return source.kind == ShaderJournal::Kind::Compute && MayContainBvhIntersect(source.code);
 	};
 	if (EnvU64("KYTY_PIPELINE_PREWARM_COMPUTE", m_list != nullptr ? 1 : 0) != 0) {
-		const auto threads = static_cast<size_t>(
-		    std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_PREWARM_THREADS", prepare ? 4 : 1), 1, 8));
-		m_compute_prewarm  = std::make_unique<ComputePrewarm>(*this, threads);
+		const auto threads = static_cast<size_t>(std::clamp<uint64_t>(
+		    EnvU64("KYTY_PIPELINE_PREWARM_THREADS", preload ? std::max(2u, ShaderPreloadThreads() / 2) : prepare ? 4 : 1),
+		    1, 8));
+		m_compute_prewarm  = std::make_unique<ComputePrewarm>(*this, threads, preload);
 		m_program_cache->prewarm_all_compute = true;
 		PipelineCacheLog("Compute prewarm: the pipelines of replayed compute programs are built on {} background "
 		                 "thread(s)", threads);
@@ -6209,11 +6478,22 @@ void PipelineCache::InitializeShaderPrecompile() {
 	};
 	replay.log         = [](const std::string& message) { PipelineCacheLog("{}", message); };
 	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
+	const auto replay_threads = replay.threads;
+	if (preload) {
+		// Before the workers start: the RT kernels' builds they request run at full speed.
+		m_preloading.store(true, std::memory_order_release);
+	}
 	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
 	    *m_shader_journal, std::move(replay),
 	    [this](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
 		    return m_program_cache->ReplayEntry(source, entry);
 	    });
+	if (preload) {
+		m_preload_pending = true;
+		PipelineCacheLog("Shader preload: {} journaled shader permutations are compiled on {} threads before the "
+		                 "game starts",
+		                 m_shader_precompiler->GetProgress().total, replay_threads);
+	}
 	if (EnvU64("KYTY_SHADER_PRECOMPILE_WAIT", 0) != 0) {
 		// Start-up waits for the replay (the best case of precompiling: tests, measurements).
 		m_shader_precompiler->Wait();
@@ -7325,16 +7605,26 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	FastFirstState::GraphicsFast    fast_result;
 	GraphicsContent                 content;
 	const bool                      keyed = m_known != nullptr || m_journal != nullptr;
+	// A pipeline the shader preload built for this key (ResidentPipelines): no driver call.
+	bool       adopted     = false;
+	const auto take_resident = [&](vk::Pipeline* pipeline) {
+		if (m_resident == nullptr || content.key == 0) return false;
+		*pipeline = m_resident->Take(m_graphics, content.key);
+		adopted   = *pipeline != nullptr;
+		return adopted;
+	};
 	if (m_fast_first != nullptr && !prefetched && !m_fast_first->scheduler.Stopped()) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
 			if (keyed) content = DescribeGraphicsPipeline(info, layout_signature);
+			if (take_resident(pipeline)) return vk::Result::eSuccess;
 			return m_fast_first->CreateGraphics(info, content, pipeline, fast_result);
 		};
 	} else if (keyed && !prefetched) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
 			content           = DescribeGraphicsPipeline(info, layout_signature);
+			if (take_resident(pipeline)) return vk::Result::eSuccess;
 			const auto result = m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &info, nullptr, pipeline);
 			if (result == vk::Result::eSuccess) NoteKnownPipeline(content.key);
 			return result;
@@ -7407,7 +7697,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	auto* made = prefetched || library_result.path == GraphicsPipelineLibrary::Path::Linked
 	                 ? &totals.gfx_other
-	             : fast_result.cache_hit || library_result.path == GraphicsPipelineLibrary::Path::CacheHit
+	             : adopted || fast_result.cache_hit || library_result.path == GraphicsPipelineLibrary::Path::CacheHit
 	                 ? &totals.gfx_hit
 	             : built_fast ? &totals.gfx_fast
 	                          : &totals.gfx_full;
@@ -7431,7 +7721,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	AddCompileStall(create_ns);
 	// A fast build left the driver cache untouched; its optimized build notes the creation. A probe
 	// hit added nothing to it.
-	if (!prefetched && !built_fast && !fast_result.cache_hit) NotePipelineCreated(create_ns);
+	if (!prefetched && !built_fast && !fast_result.cache_hit && !adopted) NotePipelineCreated(create_ns);
 	if (content.key != 0 && (m_journal != nullptr || m_journal_replay != nullptr)) {
 		NoteJournalPipeline(content.key, content.words, content.snapshot_words, content.identities, guest);
 	}
@@ -7517,7 +7807,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 }
 
 PipelineCache::RtState& PipelineCache::Rt() {
-	std::call_once(m_rt_once, [this] { m_rt = std::make_unique<RtState>(*this); });
+	std::call_once(m_rt_once, [this] {
+		m_rt = std::make_unique<RtState>(*this);
+		m_rt_ready.store(true, std::memory_order_release);
+	});
 	return *m_rt;
 }
 

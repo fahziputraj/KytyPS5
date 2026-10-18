@@ -66,6 +66,7 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		int                            index      = 0;
 		uint8_t                        cache      = 0;
 		uint8_t                        preference = 0;
+		uint8_t                        efficiency = 0; // Intel hybrid: a P-core is above an E-core
 		bool                           whole      = true; // every logical processor allowed
 		bool                           has_zero   = false;
 		std::vector<const CpuSetInfo*> processors;
@@ -81,6 +82,7 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		core.index      = set.core;
 		core.cache      = set.cache;
 		core.preference = std::max(core.preference, set.scheduling_class);
+		core.efficiency = std::max(core.efficiency, set.efficiency_class);
 		core.whole      = core.whole && set.allowed;
 		core.has_zero   = core.has_zero || set.logical == 0;
 		core.processors.push_back(&set);
@@ -118,6 +120,9 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 	std::sort(candidates.begin(), candidates.end(), [](const Core* a, const Core* b) {
 		if (a->has_zero != b->has_zero) {
 			return !a->has_zero; // the core of processor 0 (interrupts) last
+		}
+		if (a->efficiency != b->efficiency) {
+			return a->efficiency > b->efficiency; // a P-core before an E-core
 		}
 		if (a->preference != b->preference) {
 			return a->preference > b->preference;
@@ -535,6 +540,7 @@ std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity, const std::vector<ULONG>
 			set.core             = cpu.CoreIndex;
 			set.cache            = cpu.LastLevelCacheIndex;
 			set.scheduling_class = cpu.SchedulingClass;
+			set.efficiency_class = cpu.EfficiencyClass;
 			const bool ours      = cpu.Allocated == 0 || cpu.AllocatedToTargetProcess != 0;
 			const bool in_constraint =
 			    restriction != 0
@@ -576,9 +582,19 @@ std::vector<L3Cache> ReadL3Caches() {
 		if (info->Relationship == RelationCache && cache.Level == 3 &&
 		    (cache.Type == CacheUnified || cache.Type == CacheData)) {
 			// GroupCount is 0 (a reserved field) before Windows 11: one GroupMask.
-			const WORD count = cache.GroupCount == 0 ? WORD {1} : cache.GroupCount;
+#if defined(NTDDI_WIN10_CO)
+			const WORD  group_count = cache.GroupCount;
+			const auto* groups      = cache.GroupMasks;
+#else
+			// Windows SDKs before 10.0.22000 call GroupCount Reserved[18..19] and declare one
+			// GroupMask; Windows 11 still writes the array there.
+			WORD group_count = 0;
+			std::memcpy(&group_count, &cache.Reserved[18], sizeof(group_count));
+			const auto* groups = &cache.GroupMask;
+#endif
+			const WORD count = group_count == 0 ? WORD {1} : group_count;
 			for (WORD i = 0; i < count; i++) {
-				const auto& group = cache.GroupMasks[i];
+				const auto& group = groups[i];
 				caches.push_back({group.Group, static_cast<uint64_t>(group.Mask), cache.CacheSize});
 			}
 		}
@@ -757,6 +773,55 @@ void LogVCacheLocked(State& state, const char* why, const std::string& text) {
 	std::fflush(stdout);
 }
 
+// KYTY_HYBRID_PLACEMENT (default auto; 0/off: nothing changes).
+bool HybridPlacementEnabled() {
+	static const bool enabled = [] {
+		const auto* value = EnvValue("KYTY_HYBRID_PLACEMENT");
+		return value == nullptr || (std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0);
+	}();
+	return enabled;
+}
+
+// State mutex held, the layout computed: on a hybrid processor, the slower cores' allowed
+// processors (outside any reserved core) become the cold threads' (CpuLayout::hybrid).
+void ApplyHybridColdLocked(State& state) {
+	state.layout.hybrid = false;
+	if (!HybridPlacementEnabled()) {
+		return;
+	}
+	uint8_t fastest = 0;
+	uint8_t slowest = UINT8_MAX;
+	for (const auto& set: state.sets) {
+		if (set.allowed && set.group == 0 && set.logical < 64) {
+			fastest = std::max(fastest, set.efficiency_class);
+			slowest = std::min(slowest, set.efficiency_class);
+		}
+	}
+	if (slowest == UINT8_MAX || fastest == slowest) {
+		return;
+	}
+	const uint64_t reserved = state.layout.cp_mask | state.layout.recorder_mask;
+	std::vector<uint32_t> ids;
+	uint64_t              mask = 0;
+	for (const auto& set: state.sets) {
+		if (!set.allowed || set.group != 0 || set.logical >= 64 || set.efficiency_class == fastest ||
+		    ((reserved >> set.logical) & 1u) != 0) {
+			continue;
+		}
+		ids.push_back(set.id);
+		mask |= uint64_t {1} << set.logical;
+	}
+	if (ids.size() < 2) {
+		return;
+	}
+	state.layout.hybrid    = true;
+	state.layout.cold_ids  = std::move(ids);
+	state.layout.cold_mask = mask;
+	state.layout.description += (state.layout.description.empty() ? "" : "; ") +
+	                            std::string("cold threads on the E-cores, logical ") + MaskText(mask) +
+	                            " (KYTY_HYBRID_PLACEMENT)";
+}
+
 // State mutex held: computes the layout for the current process mask and constraint and applies
 // it: the process default CPU sets (the general processors of a reservation, the hot processors
 // of the V-cache placement, or every allowed processor with only KYTY_CPU_SETS), the reserved
@@ -785,7 +850,11 @@ void ApplyLayoutLocked(State& state, const char* why, bool log = true, bool keep
 	if (log) {
 		LogVCacheLocked(state, why, vcache_text);
 	}
-	const bool active = mode != CpuReserveMode::Off || restriction != 0 || state.layout.vcache;
+	if (!state.layout.vcache) {
+		ApplyHybridColdLocked(state);
+	}
+	const bool active =
+	    mode != CpuReserveMode::Off || restriction != 0 || state.layout.vcache || state.layout.hybrid;
 #if defined(_WIN32)
 	if (!active && !state.applied_default && !state.vcache_applied) {
 		return;
@@ -844,8 +913,8 @@ void ApplyLayoutLocked(State& state, const char* why, bool log = true, bool keep
 		}
 	}
 	for (const auto& thread: state.cold) {
-		ApplyThreadSets(thread.handle,
-		                state.layout.vcache ? state.layout.cold_ids : std::vector<uint32_t> {});
+		ApplyThreadSets(thread.handle, state.layout.vcache || state.layout.hybrid ? state.layout.cold_ids
+		                                                                          : std::vector<uint32_t> {});
 	}
 	state.vcache_applied = state.layout.vcache;
 #else
@@ -1047,7 +1116,7 @@ struct ColdRegistration {
 		                    FALSE, DUPLICATE_SAME_ACCESS) != 0) {
 			state.cold.push_back({tid, handle});
 		}
-		if (state.layout.vcache) {
+		if (state.layout.vcache || state.layout.hybrid) {
 			ApplyThreadSets(GetCurrentThread(), state.layout.cold_ids);
 		}
 	}

@@ -720,8 +720,34 @@ static void InitCudaEarly() {
 }
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+// Windows 11 runs a process whose window is in the background or covered with EcoQoS (on Intel
+// hybrid processors: on the E-cores, at a lower clock) and ignores its 1 ms timer resolution then,
+// so the guest's timed waits stretch to 15.6 ms. Both are turned off for the whole process, the
+// guest's threads included (the service threads already opt out one by one).
+// KYTY_ECOQOS=1 keeps the Windows defaults.
+static void DisableProcessPowerThrottling() {
+	if (const char* value = std::getenv("KYTY_ECOQOS"); value != nullptr && std::strcmp(value, "1") == 0) {
+		return;
+	}
+	PROCESS_POWER_THROTTLING_STATE state {};
+	state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+	state.StateMask   = 0;
+	if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state)) == 0) {
+		// Before Windows 11 the timer-resolution flag is unknown: keep the execution-speed part.
+		state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+		(void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+	}
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DisableProcessPowerThrottling();
 	InitCudaEarly();
 #endif
 	VirtualMemory::Init();

@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "common/u59Preset.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPreload.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
@@ -180,6 +181,9 @@ static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
 	    [](void* param) {
+		    // KYTY_SHADER_PRELOAD: the game starts once the shaders and pipelines of earlier runs are
+		    // prepared; the main thread keeps the window responsive and shows the progress meanwhile.
+		    Libs::Graphics::WaitForShaderPreload();
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
 	    },

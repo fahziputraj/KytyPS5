@@ -101,6 +101,25 @@ void TestLayouts() {
 		      "off reserves nothing");
 	}
 	{
+		// i5-13500: 6 P-cores with SMT (logical 0-11, EfficiencyClass 1) and 8 E-cores (12-19,
+		// EfficiencyClass 0), one L3. E-cores reporting a higher SchedulingClass still lose.
+		std::vector<CpuSetInfo> hybrid;
+		for (uint32_t lp = 0; lp < 20; lp++) {
+			CpuSetInfo set;
+			set.id               = 256 + lp;
+			set.logical          = static_cast<uint8_t>(lp);
+			set.core             = static_cast<uint8_t>(lp < 12 ? lp & ~1u : lp);
+			set.scheduling_class = static_cast<uint8_t>(lp < 12 ? 1 : 9);
+			set.efficiency_class = static_cast<uint8_t>(lp < 12 ? 1 : 0);
+			set.allowed          = true;
+			hybrid.push_back(set);
+		}
+		const auto layout = ComputeCpuLayout(hybrid, CpuReserveMode::Cp, -1);
+		Check(layout.reserved && layout.cp_core == 2 && layout.cp_mask == 0xC &&
+		          layout.general_mask == (0xFFFFFu & ~0xCu),
+		      "Intel hybrid: CP on a P-core (logical 2-3), never on an E-core");
+	}
+	{
 		const auto layout = ComputeCpuLayout(lasso, CpuReserveMode::Cp, -1);
 		Check(layout.reserved && layout.cp_core == 2 && layout.cp_mask == 0xC,
 		      "Lasso mask: CP on logical 2-3 (preference 7)");
