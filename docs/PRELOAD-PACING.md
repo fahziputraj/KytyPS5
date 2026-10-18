@@ -97,3 +97,38 @@ Jetsku/KytyPS5#58 is merged: CUDA is initialized before the guest address space,
 Smooth Motion (RTX 50 driver frame generation, enabled per program in the NVIDIA App) can start
 for `kyty_emulator.exe`. It doubles the presented frames; it does not change the game's own speed.
 `KYTY_CUDA_EARLY_INIT=0` turns the early initialization off.
+
+## Fewer first-time freezes: parallel pipeline prefetch
+
+A pipeline no earlier run journaled is still compiled on first use. Before, with fast-first on
+(NVIDIA), each one was built on the command processor, one after another: a burst of 32 new
+pipelines froze Astro Bot for about 6 s. Now `KYTY_PIPELINE_PREFETCH` works together with
+fast-first: draw preparation predicts the pipelines of upcoming draws and
+`KYTY_PIPELINE_PREFETCH_THREADS` workers (default 6) build their unoptimized versions in
+parallel (or take a preloaded one); the optimized builds still follow in the background, and
+these pipelines are journaled for the next preload as before.
+
+## Native upscaler: FSR 1 (`KYTY_PRESENT_UPSCALER`)
+
+A game frame smaller than the window (Astro Bot outputs 1080p below a 4K window) is upscaled with
+AMD FidelityFX Super Resolution 1: EASU edge-adaptive upsampling, then RCAS sharpening
+(`KYTY_PRESENT_FSR_SHARPNESS`, stops, 0 = sharpest, default 0.25). `KYTY_PRESENT_UPSCALER=bilinear`
+keeps the old blit. HDR frames keep the blit. To use it on a 1440p monitor set the launcher's
+resolution to 2560x1440 or use fullscreen. The FSR 1 shader headers are MIT licensed
+(`src/graphics/host_gpu/shaders/ffx`, `LICENSES/FidelityFX-SDK-MIT.txt`).
+
+## Frame generation: NVIDIA Smooth Motion
+
+Game-integrated frame generation (FSR 3, DLSS FG) needs the game's motion vectors, which an
+emulator cannot obtain in general. On RTX 50 GPUs NVIDIA Smooth Motion generates frames in the
+driver instead: NVIDIA App > Graphics > Program Settings > add `kyty_emulator.exe` > Smooth
+Motion: On (driver 590 or newer; 617.42 tested). The emulator initializes CUDA early so the
+driver's frame generation can start (`CUDA: initialized ... (cuInit 0)` in the log). It doubles
+the presented frames; it does not change the game's own speed or input latency for the better.
+
+## Accuracy
+
+The launcher's accurate options are the ones to keep for the most faithful image: accurate GPU
+occlusion, linear-image readback, raw-image buffer sync and tessellation (all on in the current
+`Kyty.ini`). The fork's other speedups are verified to give identical results. Remaining
+differences from the console are emulator bugs of individual games, not settings.

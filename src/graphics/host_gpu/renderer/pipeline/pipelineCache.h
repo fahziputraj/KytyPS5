@@ -422,6 +422,8 @@ private:
 	// null when off.
 	struct ResidentPipelines;
 	std::unique_ptr<ResidentPipelines> m_resident;
+	// The pipeline the shader preload kept for this content key, now the caller's; null when none.
+	[[nodiscard]] vk::Pipeline TakeResidentPipeline(uint64_t key);
 	// A start-up replay runs that the game is to wait for (WaitShaderPreload).
 	std::atomic<bool> m_preload_pending {false};
 	// From then until WaitShaderPreload is done: background builds started meanwhile (the RT

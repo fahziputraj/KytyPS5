@@ -53,6 +53,43 @@ private:
 	vk::Pipeline            m_pipeline    = nullptr;
 };
 
+// KYTY_PRESENT_UPSCALER (default fsr; =bilinear: the blit): a video-out frame smaller than the
+// window is upscaled with AMD FidelityFX Super Resolution 1, EASU edge-adaptive upsampling into an
+// intermediate image, then RCAS sharpening into the target. KYTY_PRESENT_FSR_SHARPNESS: the RCAS
+// reduction in stops (0 = sharpest, default 0.25, 2 = soft). HDR frames keep the blit.
+class PresentUpscaler final {
+public:
+	PresentUpscaler()  = default;
+	~PresentUpscaler() = default;
+	KYTY_CLASS_NO_COPY(PresentUpscaler);
+
+	[[nodiscard]] static bool Enabled() noexcept;
+	// Whether `source` is upscaled to `target` (larger on an axis, smaller on none).
+	[[nodiscard]] static bool Applies(vk::Extent2D source, vk::Extent2D target) noexcept;
+	// Scales all of `source_view` (eShaderReadOnlyOptimal) over all of `target_view`
+	// (eColorAttachmentOptimal).
+	void Record(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView source_view,
+	            vk::Extent2D source, vk::ImageView target_view, vk::Format target_format,
+	            vk::Extent2D target);
+	void Release(GraphicContext& graphics);
+
+private:
+	void EnsurePipelines(vk::Device device, vk::Format target_format);
+	void EnsureIntermediate(GraphicContext& graphics, vk::Extent2D extent);
+
+	vk::Sampler             m_sampler      = nullptr;
+	vk::DescriptorSetLayout m_descriptors  = nullptr;
+	vk::PipelineLayout      m_easu_layout  = nullptr;
+	vk::PipelineLayout      m_rcas_layout  = nullptr;
+	vk::Pipeline            m_easu         = nullptr;
+	vk::Pipeline            m_rcas         = nullptr;
+	vk::Format              m_rcas_format  = vk::Format::eUndefined;
+	VulkanImage             m_intermediate;
+	vk::ImageView           m_intermediate_view = nullptr;
+	vk::Extent2D            m_extent {};
+	bool                    m_logged = false;
+};
+
 struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
