@@ -90,7 +90,9 @@ the game's frame rate, seconds-per-step and microseconds-per-step values, and th
 them from the measured frame period on every presented main-output frame (`simulation_clock`,
 src/loader/simulationClock.h): between 60 and 30 FPS the world advances by the real elapsed time,
 smoothed over about 80 ms, with timing debt repaid over about 600 ms; stalls over 250 ms reset it
-instead of fast-forwarding. Below 30 FPS it still slows down.
+instead of fast-forwarding. `-clock-adaptive20.json` (installed as the active patch) follows the
+real frame period down to 20 FPS; larger steps can make fast collisions and jumps less precise, so
+`-clock-adaptive.json` (30-60 FPS) remains available. Below the floor the game still slows down.
 
 The launcher applies `_Patches/PPSA21567.json` beside it (installed in F:/KytyPS5-Build with the
 adaptive clock; turn it off in the launcher's cheats/patches dialog). `-clock30.json` is the fixed
@@ -98,6 +100,14 @@ adaptive clock; turn it off in the launcher's cheats/patches dialog). `-clock30.
 maintainer), so the game never runs double speed with the 1/30 s step. The log shows
 `Game simulation clock: adaptive 60.00-to-30.00 FPS, 3 guarded field(s)` when it is active.
 Other games and versions need their own verified patch.
+
+## Recommended launcher settings for speed
+
+Measured on ASTRO BOT (same 100 s from the save, Mailbox, adaptive clock): with "Enable readback",
+"Accurate occlusion queries" and "Accurate texture synchronization" on, 44.9 FPS on average and
+18-47 FPS in the heaviest part; with the three off, 51.4 FPS on average and 35-57 FPS (memory-fault
+cost 5.6 instead of 8.1 ms per frame). Keep them off unless a game shows a visibility or texture
+problem that needs them; keep tessellation on, Mailbox and 60 Hz vblank.
 
 ## Scheduling (`KYTY_HYBRID_PLACEMENT`, `KYTY_ECOQOS`)
 
